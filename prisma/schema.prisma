@@ -1,0 +1,187 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+
+// prisma/schema.prisma – Industry-grade schema for MobiTickets (2026-ready)
+// Enforces CIA: Confidentiality (RBAC, hashed creds), Integrity (transactions, audits), Availability (indexes, quantities)
+
+generator client {
+  provider = "prisma-client-js"
+  // output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+ // url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ATTENDEE
+  ORGANIZER
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+  REFUNDED
+}
+
+enum TicketStatus {
+  AVAILABLE
+  RESERVED
+  SOLD
+}
+
+model User {
+  id           String         @id @default(uuid()) @db.Uuid
+  email        String         @unique
+  passwordHash String?
+  role         Role           @default(ATTENDEE)
+  fullName     String?
+  avatarUrl    String?        // Cloudinary URL
+  bio          String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  events       Event[]
+  orders       Order[]
+  auditLogs    AuditLog[]
+  refreshTokens RefreshToken[]
+
+  @@index([email])
+  @@map("users")
+}
+
+model Event {
+  id            String        @id @default(uuid()) @db.Uuid
+  title         String
+  description   String?
+  startTime     DateTime
+  endTime       DateTime?
+  location      Json?         // { venue, address, lat, lng }
+  posterUrl     String?       // Cloudinary
+  videoUrl      String?       // Cloudinary
+  organizerId   String        @db.Uuid
+  isPublished   Boolean       @default(false)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  organizer     User          @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+  tickets       Ticket[]
+  orders        Order[]
+
+  @@index([startTime])
+  @@index([organizerId])
+  @@index([startTime, isPublished])
+  @@map("events")
+}
+
+model Ticket {
+  id                String        @id @default(uuid()) @db.Uuid
+  eventId           String        @db.Uuid
+  type              String        // VIP/Regular/etc.
+  price             Float
+  totalQuantity     Int
+  availableQuantity Int
+  status            TicketStatus  @default(AVAILABLE)
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  event             Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  orderItems        OrderItem[]
+
+  @@index([eventId])
+  @@index([eventId, status])
+  @@index([availableQuantity])
+  @@map("tickets")
+}
+
+model Order {
+  id            String        @id @default(uuid()) @db.Uuid
+  userId        String        @db.Uuid
+  eventId       String        @db.Uuid
+  totalAmount   Float
+  status        OrderStatus   @default(PENDING)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event         Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  items         OrderItem[]
+  transaction   Transaction?
+
+  @@index([userId])
+  @@index([eventId])
+  @@index([status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id          String  @id @default(uuid()) @db.Uuid
+  orderId     String  @db.Uuid
+  ticketId    String  @db.Uuid
+  quantity    Int
+  priceAtTime Float
+
+  order       Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  ticket      Ticket  @relation(fields: [ticketId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([ticketId])
+  @@map("order_items")
+}
+
+model Transaction {
+  id              String   @id @default(uuid()) @db.Uuid
+  orderId         String   @unique @db.Uuid
+  amount          Float
+  paymentMethod   String?
+  status          String   @default("PENDING")
+  gatewayTxId     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  order           Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("transactions")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String?  @db.Uuid
+  action    String
+  entity    String
+  entityId  String?
+  ipAddress String?
+  data      Json?
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@map("audit_logs")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  revoked   Boolean  @default(false)
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([token])
+  @@map("refresh_tokens")
+}
