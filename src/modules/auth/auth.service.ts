@@ -30,11 +30,31 @@ export const registerUser = async (
   data: RegisterInput,
   _fastify: FastifyInstance
 ): Promise<UserResponse> => {
-  const { email, password, fullName } = data;
+  const {
+    email,
+    password,
+    fullName,
+    role = 'ATTENDEE',
+    phoneNumber,
+    dateOfBirth,
+    idNumber,
+    county,
+    city,
+    emergencyContact,
+  } = data;
 
-  const existing = await prisma.user.findUnique({ where: { email } });
-  if (existing) {
+  // Check for existing email
+  const existingEmail = await prisma.user.findUnique({ where: { email } });
+  if (existingEmail) {
     throw new Error('Email already registered');
+  }
+
+  // Check for existing phone number if provided
+  if (phoneNumber) {
+    const existingPhone = await prisma.user.findFirst({ where: { phoneNumber } });
+    if (existingPhone) {
+      throw new Error('Phone number already registered');
+    }
   }
 
   const passwordHash = await argon2.hash(password, {
@@ -49,16 +69,32 @@ export const registerUser = async (
       email,
       passwordHash,
       fullName,
-      role: 'ATTENDEE',
+      role,
+      phoneNumber,
+      dateOfBirth,
+      idNumber,
+      county,
+      city,
+      emergencyContact: emergencyContact ? emergencyContact : undefined,
     },
   });
 
-  await logAudit('USER_REGISTERED', 'User', user.id, user.id, { email });
+  await logAudit('USER_REGISTERED', 'User', user.id, user.id, {
+    email,
+    role,
+    phoneNumber: phoneNumber ? '***' + phoneNumber.slice(-4) : undefined, // Mask phone for audit
+  });
 
   return {
     id: user.id,
     email: user.email,
     role: user.role,
+    fullName: user.fullName ?? undefined,
+    phoneNumber: user.phoneNumber ?? undefined,
+    dateOfBirth: user.dateOfBirth?.toISOString(),
+    county: user.county ?? undefined,
+    city: user.city ?? undefined,
+    isVerified: user.isVerified,
   };
 };
 
@@ -70,13 +106,18 @@ export const loginUser = async (
   const { email, password } = data;
 
   const user = await prisma.user.findUnique({ where: { email } });
-  
+
   if (!user || !user.passwordHash) {
     throw new Error('Invalid credentials');
   }
 
+  // Check if user is active
+  if (!user.isActive) {
+    throw new Error('Account is deactivated. Please contact support.');
+  }
+
   const isValidPassword = await argon2.verify(user.passwordHash, password);
-  
+
   if (!isValidPassword) {
     throw new Error('Invalid credentials');
   }
@@ -98,6 +139,10 @@ export const loginUser = async (
       id: user.id,
       email: user.email,
       role: user.role,
+      fullName: user.fullName ?? undefined,
+      avatarUrl: user.avatarUrl ?? undefined,
+      phoneNumber: user.phoneNumber ?? undefined,
+      isVerified: user.isVerified,
     },
   };
 };
@@ -183,10 +228,10 @@ export const walletLogin = async (
     throw new Error('Signature expired. Please try again.');
   }
 
-  // 2. Check nonce hasn't been used (Redis with TTL)
+  // 2. Check nonce hasn't been used (Upstash Redis with TTL)
   const nonceKey = `wallet_nonce:${nonce}`;
   const nonceExists = await redis.exists(nonceKey);
-  if (nonceExists) {
+  if (nonceExists > 0) {
     throw new Error('Nonce already used. Potential replay attack detected.');
   }
 
@@ -208,7 +253,7 @@ export const walletLogin = async (
   }
 
   // 5. Store nonce to prevent replay (TTL = 10 minutes)
-  await redis.setex(nonceKey, 600, '1');
+  await redis.set(nonceKey, '1', { ex: 600 });
 
   // Find or create user (using address as identifier)
   const walletEmail = `${address.toLowerCase()}@wallet`;

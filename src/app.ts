@@ -12,6 +12,7 @@ import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-
 import { envConfig } from './config/env';
 import { prisma } from './lib/prisma';
 import { redis } from './lib/redis';
+// Note: Upstash Redis is stateless (HTTP-based) - no connection management needed
 import errorHandlerPlugin from './middleware/errorHandler';
 import authPlugin from './middleware/auth';
 
@@ -21,6 +22,9 @@ import eventsRoutes from './modules/events/events.routes';
 import ticketsRoutes from './modules/tickets/tickets.routes';
 import usersRoutes from './modules/users/users.routes';
 import adminRoutes from './modules/admin/admin.routes';
+import notificationRoutes from './modules/notifications/notification.routes';
+import flashSalesRoutes from './modules/flashsales/flashsales.routes';
+import webhookRoutes from './modules/webhooks/webhooks.routes';
 
 // ────────────────────────────────────────────────
 // Create Fastify instance with Zod Type Provider
@@ -113,12 +117,26 @@ fastify.register(errorHandlerPlugin);   // Global error handler
 // ────────────────────────────────────────────────
 // Health Check Endpoint
 // ────────────────────────────────────────────────
-fastify.get('/health', async () => ({
-  status: 'ok',
-  uptime: process.uptime(),
-  timestamp: new Date().toISOString(),
-  env: envConfig.NODE_ENV,
-}));
+fastify.get('/health', async () => {
+  // Test Upstash Redis connectivity
+  let redisStatus = 'unknown';
+  try {
+    const pong = await redis.ping();
+    redisStatus = pong === 'PONG' ? 'connected' : 'error';
+  } catch {
+    redisStatus = 'disconnected';
+  }
+
+  return {
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    env: envConfig.NODE_ENV,
+    services: {
+      redis: redisStatus,
+    },
+  };
+});
 
 // ────────────────────────────────────────────────
 // Register Domain Modules (with prefixes)
@@ -128,6 +146,99 @@ fastify.register(eventsRoutes,  { prefix: '/api/events' });
 fastify.register(ticketsRoutes, { prefix: '/api/tickets' });
 fastify.register(usersRoutes,   { prefix: '/api/users' });
 fastify.register(adminRoutes,   { prefix: '/api/admin' });
+fastify.register(notificationRoutes, { prefix: '/api/notifications' });
+fastify.register(flashSalesRoutes, { prefix: '/api/flash-sales' });
+
+// QStash Webhook endpoints (for background job processing)
+// These endpoints are called by Upstash QStash, not by users directly
+fastify.register(webhookRoutes, { prefix: '/api/webhooks' });
+
+// ────────────────────────────────────────────────
+// Server-Sent Events (SSE) for Real-time Notifications
+// ────────────────────────────────────────────────
+// Store active SSE connections per user
+const sseConnections = new Map<string, Set<NodeJS.WritableStream>>();
+
+// SSE route as a proper plugin (ensures auth plugin is loaded first)
+fastify.register(async (instance) => {
+  instance.get('/api/sse/notifications', {
+    preHandler: [instance.authenticate],
+  }, async (request, reply) => {
+    const userId = request.user!.id;
+
+    // Set SSE headers
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      'X-Accel-Buffering': 'no', // Disable nginx buffering
+    });
+
+    // Add connection to the map
+    if (!sseConnections.has(userId)) {
+      sseConnections.set(userId, new Set());
+    }
+    sseConnections.get(userId)!.add(reply.raw);
+
+    // Send initial connection message
+    reply.raw.write(`data: ${JSON.stringify({ type: 'connected', message: 'SSE connection established' })}\n\n`);
+
+    // Keep-alive ping every 30 seconds
+    const pingInterval = setInterval(() => {
+      try {
+        reply.raw.write(`: ping\n\n`);
+      } catch {
+        clearInterval(pingInterval);
+      }
+    }, 30000);
+
+    // Handle client disconnect
+    request.raw.on('close', () => {
+      clearInterval(pingInterval);
+      const userConnections = sseConnections.get(userId);
+      if (userConnections) {
+        userConnections.delete(reply.raw);
+        if (userConnections.size === 0) {
+          sseConnections.delete(userId);
+        }
+      }
+      instance.log.info(`SSE connection closed for user ${userId}`);
+    });
+
+    // Don't end the response - keep it open for SSE
+    return reply;
+  });
+});
+
+// Helper function to send SSE notification to a specific user (exported for use in services)
+export const sendSSENotification = (userId: string, data: Record<string, unknown>) => {
+  const userConnections = sseConnections.get(userId);
+  if (userConnections) {
+    const message = `data: ${JSON.stringify(data)}\n\n`;
+    userConnections.forEach((stream) => {
+      try {
+        stream.write(message);
+      } catch {
+        // Connection might be closed, ignore
+      }
+    });
+  }
+};
+
+// Broadcast to all connected users (for system-wide notifications)
+export const broadcastSSENotification = (data: Record<string, unknown>) => {
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  sseConnections.forEach((connections) => {
+    connections.forEach((stream) => {
+      try {
+        stream.write(message);
+      } catch {
+        // Connection might be closed, ignore
+      }
+    });
+  });
+};
 
 // ────────────────────────────────────────────────
 // Catch-all 404 Handler
@@ -152,12 +263,12 @@ const shutdown = async (signal: string): Promise<void> => {
     fastify.log.info('HTTP server closed');
 
     // Close database connections
-    await prisma.$disconnect();
-    fastify.log.info('Database connection closed');
+    if (prisma) {
+      await prisma.$disconnect();
+      fastify.log.info('Database connection closed');
+    }
 
-    // Close Redis connection
-    await redis.quit();
-    fastify.log.info('Redis connection closed');
+    // Note: Upstash Redis is stateless (HTTP-based) - no connection to close
 
     fastify.log.info('✅ Server shutdown complete');
     process.exit(0);

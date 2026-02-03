@@ -14,9 +14,19 @@ const envSchema = z.object({
   
   // Database - Support both standard PostgreSQL and Prisma Postgres URLs
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
-  
-  // Redis - Fixed: Redis default port is 6379, not 5432
-  REDIS_URL: z.string().min(1, 'REDIS_URL is required'),
+
+  // Upstash Redis (serverless, HTTP-based)
+  UPSTASH_REDIS_REST_URL: z.string().url('UPSTASH_REDIS_REST_URL must be a valid URL'),
+  UPSTASH_REDIS_REST_TOKEN: z.string().min(1, 'UPSTASH_REDIS_REST_TOKEN is required'),
+
+  // Upstash QStash (serverless message queue for background jobs)
+  QSTASH_TOKEN: z.string().min(1, 'QSTASH_TOKEN is required'),
+  QSTASH_CURRENT_SIGNING_KEY: z.string().min(1, 'QSTASH_CURRENT_SIGNING_KEY is required'),
+  QSTASH_NEXT_SIGNING_KEY: z.string().min(1, 'QSTASH_NEXT_SIGNING_KEY is required'),
+
+  // Webhook base URL (your public URL that QStash will call)
+  // In development, use ngrok or similar tunneling service
+  WEBHOOK_BASE_URL: z.string().url().optional(),
   
   // JWT Secrets (ultra-long random strings recommended)
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
@@ -39,13 +49,11 @@ const envSchema = z.object({
   CORS_ORIGIN: z.string().default('http://localhost:3000'),
   CORS_CREDENTIALS: z.coerce.boolean().default(true),
 
-  // Email/SMTP Configuration (Optional - for production)
-  SMTP_HOST: z.string().optional(),
-  SMTP_PORT: z.coerce.number().default(587),
-  SMTP_SECURE: z.coerce.boolean().default(false),
-  SMTP_USER: z.string().optional(),
-  SMTP_PASS: z.string().optional(),
-  SMTP_FROM: z.string().default('noreply@mobitickets.com'),
+  // Resend Email Configuration
+  // Get your API key from: https://resend.com/api-keys
+  RESEND_API_KEY: z.string().min(1, 'RESEND_API_KEY is required'),
+  // Sender email (must be verified in Resend or use onboarding@resend.dev for testing)
+  EMAIL_FROM: z.string().default('MobiTickets <onboarding@resend.dev>'),
 });
 
 const env = envSchema.safeParse(process.env);

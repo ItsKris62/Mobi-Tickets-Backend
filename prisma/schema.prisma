@@ -16,8 +16,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
- // url      = env("DATABASE_URL")
+  provider = "mysql"
 }
 
 enum Role {
@@ -39,74 +38,152 @@ enum TicketStatus {
   SOLD
 }
 
-model User {
-  id           String         @id @default(uuid()) @db.Uuid
-  email        String         @unique
-  passwordHash String?
-  role         Role           @default(ATTENDEE)
-  fullName     String?
-  avatarUrl    String?        // Cloudinary URL
-  bio          String?
-  createdAt    DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  POSTPONED
+  CANCELLED
+  COMPLETED
+}
 
-  events       Event[]
-  orders       Order[]
-  auditLogs    AuditLog[]
-  refreshTokens RefreshToken[]
+enum TicketCategory {
+  REGULAR
+  VIP
+  VVIP
+}
+
+enum NotificationType {
+  TICKET_PURCHASE
+  EVENT_POSTPONED
+  EVENT_CANCELLED
+  EVENT_REMINDER
+  FLASH_SALE
+  REFUND_PROCESSED
+  SYSTEM
+}
+
+model User {
+  id               String         @id @default(uuid()) @db.VarChar(36)
+  email            String         @unique
+  passwordHash     String?
+  role             Role           @default(ATTENDEE)
+  fullName         String?
+  avatarUrl        String?        // Cloudinary URL
+  bio              String?
+
+  // Kenyan context fields
+  phoneNumber      String?        // Kenyan format: +254XXXXXXXXX (for M-PESA)
+  dateOfBirth      DateTime?      // For age-restricted events
+  idNumber         String?        // Kenyan ID number (optional)
+  county           String?        // County of residence
+  city             String?        // City/Town
+  emergencyContact Json?          // { name, phoneNumber, relationship }
+
+  // Web3 integration
+  walletAddress    String?        @unique
+
+  // Account status
+  isVerified       Boolean        @default(false)
+  isActive         Boolean        @default(true)
+
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  events           Event[]
+  orders           Order[]
+  auditLogs        AuditLog[]
+  refreshTokens    RefreshToken[]
+  notifications    Notification[]
 
   @@index([email])
+  @@index([phoneNumber])
+  @@index([walletAddress])
   @@map("users")
 }
 
 model Event {
-  id            String        @id @default(uuid()) @db.Uuid
-  title         String
-  description   String?
-  startTime     DateTime
-  endTime       DateTime?
-  location      Json?         // { venue, address, lat, lng }
-  posterUrl     String?       // Cloudinary
-  videoUrl      String?       // Cloudinary
-  organizerId   String        @db.Uuid
-  isPublished   Boolean       @default(false)
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
+  id                  String        @id @default(uuid()) @db.VarChar(36)
+  title               String
+  description         String?
+  startTime           DateTime
+  endTime             DateTime?
+  originalStartTime   DateTime?     // Track original time for postponements
+  location            Json?         // { venue, address, lat, lng }
+  posterUrl           String?       // Cloudinary (REQUIRED for publishing)
+  videoUrl            String?       // Cloudinary
+  organizerId         String        @db.VarChar(36)
+  status              EventStatus   @default(DRAFT)
+  isPublished         Boolean       @default(false)
 
-  organizer     User          @relation(fields: [organizerId], references: [id], onDelete: Cascade)
-  tickets       Ticket[]
-  orders        Order[]
+  // Event restrictions
+  ageLimit            Int?          // Minimum age requirement (e.g., 18, 21)
+  maxCapacity         Int?          // Total event capacity
+
+  // Postponement info
+  postponementReason  String?
+  postponedAt         DateTime?
+
+  // Event categorization
+  category            String?       // Music, Sports, Conference, etc.
+  tags                Json?         // Tags for search (stored as JSON array)
+
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  organizer           User          @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+  tickets             Ticket[]
+  orders              Order[]
+  flashSales          FlashSale[]
+  notifications       Notification[]
 
   @@index([startTime])
   @@index([organizerId])
   @@index([startTime, isPublished])
+  @@index([status])
+  @@index([category])
   @@map("events")
 }
 
 model Ticket {
-  id                String        @id @default(uuid()) @db.Uuid
-  eventId           String        @db.Uuid
-  type              String        // VIP/Regular/etc.
-  price             Float
-  totalQuantity     Int
-  availableQuantity Int
-  status            TicketStatus  @default(AVAILABLE)
-  createdAt         DateTime      @default(now())
-  updatedAt         DateTime      @updatedAt
+  id                   String         @id @default(uuid()) @db.VarChar(36)
+  eventId              String         @db.VarChar(36)
+  category             TicketCategory @default(REGULAR)
+  name                 String         // Display name (e.g., "Early Bird VIP")
+  description          String?        // What's included
+  price                Float
+  originalPrice        Float?         // For showing discounts
+  totalQuantity        Int
+  availableQuantity    Int
+  status               TicketStatus   @default(AVAILABLE)
 
-  event             Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
-  orderItems        OrderItem[]
+  // Group ticket discounts
+  groupDiscountEnabled Boolean        @default(false)
+  groupMinSize         Int?           // Minimum group size for discount
+  groupDiscountPercent Float?         // Percentage discount (e.g., 15.0 for 15%)
+  groupMaxSize         Int?           // Maximum group size allowed
+
+  // Sale restrictions
+  maxPerPurchase       Int            @default(10)    // Max tickets per transaction
+  salesStartTime       DateTime?      // When tickets go on sale
+  salesEndTime         DateTime?      // When ticket sales end
+
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  event                Event          @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  orderItems           OrderItem[]
 
   @@index([eventId])
   @@index([eventId, status])
   @@index([availableQuantity])
+  @@index([category])
   @@map("tickets")
 }
 
 model Order {
-  id            String        @id @default(uuid()) @db.Uuid
-  userId        String        @db.Uuid
-  eventId       String        @db.Uuid
+  id            String        @id @default(uuid()) @db.VarChar(36)
+  userId        String        @db.VarChar(36)
+  eventId       String        @db.VarChar(36)
   totalAmount   Float
   status        OrderStatus   @default(PENDING)
   createdAt     DateTime      @default(now())
@@ -124,9 +201,9 @@ model Order {
 }
 
 model OrderItem {
-  id          String  @id @default(uuid()) @db.Uuid
-  orderId     String  @db.Uuid
-  ticketId    String  @db.Uuid
+  id          String  @id @default(uuid()) @db.VarChar(36)
+  orderId     String  @db.VarChar(36)
+  ticketId    String  @db.VarChar(36)
   quantity    Int
   priceAtTime Float
 
@@ -139,8 +216,8 @@ model OrderItem {
 }
 
 model Transaction {
-  id              String   @id @default(uuid()) @db.Uuid
-  orderId         String   @unique @db.Uuid
+  id              String   @id @default(uuid()) @db.VarChar(36)
+  orderId         String   @unique @db.VarChar(36)
   amount          Float
   paymentMethod   String?
   status          String   @default("PENDING")
@@ -155,8 +232,8 @@ model Transaction {
 }
 
 model AuditLog {
-  id        String   @id @default(uuid()) @db.Uuid
-  userId    String?  @db.Uuid
+  id        String   @id @default(uuid()) @db.VarChar(36)
+  userId    String?  @db.VarChar(36)
   action    String
   entity    String
   entityId  String?
@@ -172,8 +249,8 @@ model AuditLog {
 }
 
 model RefreshToken {
-  id        String   @id @default(uuid()) @db.Uuid
-  userId    String   @db.Uuid
+  id        String   @id @default(uuid()) @db.VarChar(36)
+  userId    String   @db.VarChar(36)
   token     String   @unique
   expiresAt DateTime
   createdAt DateTime @default(now())
@@ -184,4 +261,92 @@ model RefreshToken {
   @@index([userId, expiresAt])
   @@index([token])
   @@map("refresh_tokens")
+}
+
+// Real-time notification system
+model Notification {
+  id        String           @id @default(uuid()) @db.VarChar(36)
+  userId    String           @db.VarChar(36)
+  eventId   String?          @db.VarChar(36)
+  type      NotificationType
+  title     String
+  message   String
+  data      Json?            // Additional data (e.g., { eventId, oldDate, newDate })
+  isRead    Boolean          @default(false)
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event     Event?           @relation(fields: [eventId], references: [id], onDelete: SetNull)
+
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+  @@index([type])
+  @@map("notifications")
+}
+
+// Flash sale and promotional campaigns
+model FlashSale {
+  id               String   @id @default(uuid()) @db.VarChar(36)
+  eventId          String   @db.VarChar(36)
+  name             String
+  description      String?
+  discountPercent  Float    // Percentage discount (e.g., 20.0 for 20%)
+  discountAmount   Float?   // Or fixed amount discount
+  startTime        DateTime
+  endTime          DateTime
+  isActive         Boolean  @default(true)
+  maxRedemptions   Int?     // Maximum number of uses
+  currentRedemptions Int    @default(0)
+  promoCode        String?  @unique // Optional promo code
+  ticketCategories Json?            // Which ticket types this applies to (stored as JSON array)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  event            Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@index([startTime, endTime])
+  @@index([isActive])
+  @@index([promoCode])
+  @@map("flash_sales")
+}
+
+// Analytics tracking for organizers
+model EventAnalytics {
+  id              String   @id @default(uuid()) @db.VarChar(36)
+  eventId         String   @db.VarChar(36)
+  date            DateTime @db.Date
+  views           Int      @default(0)
+  uniqueVisitors  Int      @default(0)
+  ticketsSold     Int      @default(0)
+  revenue         Float    @default(0)
+  refunds         Int      @default(0)
+  refundAmount    Float    @default(0)
+
+  @@unique([eventId, date])
+  @@index([eventId])
+  @@index([date])
+  @@map("event_analytics")
+}
+
+// Organizer payout tracking
+model Payout {
+  id            String   @id @default(uuid()) @db.VarChar(36)
+  organizerId   String   @db.VarChar(36)
+  eventId       String?  @db.VarChar(36)
+  amount        Float
+  fee           Float    @default(0) // Platform fee
+  netAmount     Float    // amount - fee
+  status        String   @default("PENDING") // PENDING, PROCESSING, COMPLETED, FAILED
+  paymentMethod String?  // M-PESA, Bank Transfer, etc.
+  reference     String?  // Payment reference/transaction ID
+  processedAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([organizerId])
+  @@index([eventId])
+  @@index([status])
+  @@map("payouts")
 }
