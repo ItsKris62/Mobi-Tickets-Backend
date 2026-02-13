@@ -10,6 +10,8 @@ import {
   LoginInput,
   RefreshInput,
   WalletLoginInput,
+  ResetPasswordInput,
+  LogoutInput,
   AuthResponse,
   UserResponse,
 } from './auth.schema';
@@ -95,6 +97,41 @@ export const registerUser = async (
     county: user.county ?? undefined,
     city: user.city ?? undefined,
     isVerified: user.isVerified,
+  };
+};
+
+// Register new user and auto-login (returns tokens)
+export const registerAndLogin = async (
+  data: RegisterInput,
+  fastify: FastifyInstance
+): Promise<AuthResponse> => {
+  // First register the user
+  const userResponse = await registerUser(data, fastify);
+
+  // Then generate tokens for auto-login
+  const accessToken = await generateAccessToken(fastify, {
+    id: userResponse.id,
+    email: userResponse.email,
+    role: userResponse.role,
+  });
+
+  const refreshToken = await generateRefreshToken(userResponse.id);
+
+  await logAudit('USER_AUTO_LOGIN_AFTER_REGISTER', 'User', userResponse.id, userResponse.id, {
+    email: userResponse.email,
+  });
+
+  return {
+    accessToken,
+    refreshToken,
+    user: {
+      id: userResponse.id,
+      email: userResponse.email,
+      role: userResponse.role,
+      fullName: userResponse.fullName,
+      phoneNumber: userResponse.phoneNumber,
+      isVerified: userResponse.isVerified,
+    },
   };
 };
 
@@ -293,4 +330,80 @@ export const walletLogin = async (
       address,
     },
   };
+};
+
+// Request password reset (sends token to Redis)
+export const requestPasswordReset = async (data: ResetPasswordInput): Promise<{ message: string }> => {
+  const { email } = data;
+
+  // Always return success message to prevent email enumeration
+  const user = await prisma.user.findUnique({ where: { email } });
+
+  if (user) {
+    const resetToken = randomBytes(32).toString('hex');
+    const redisKey = `pwd_reset:${resetToken}`;
+
+    // Store token in Redis with 1 hour TTL
+    await redis.set(redisKey, user.id, { ex: 3600 });
+
+    await logAudit('PASSWORD_RESET_REQUESTED', 'User', user.id, user.id, { email });
+
+    // TODO: Send email with reset link containing the token
+    // In production, integrate with email service (e.g., Resend, SendGrid)
+  }
+
+  return { message: 'If an account with that email exists, a reset link has been sent.' };
+};
+
+// Validate JWT token and return fresh user data
+export const validateToken = async (userId: string) => {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      email: true,
+      role: true,
+      fullName: true,
+      avatarUrl: true,
+      isVerified: true,
+      isBanned: true,
+    },
+  });
+
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  return {
+    valid: true,
+    user: {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      fullName: user.fullName ?? undefined,
+      avatarUrl: user.avatarUrl ?? undefined,
+      isVerified: user.isVerified,
+      isBanned: user.isBanned,
+    },
+  };
+};
+
+// Logout user by revoking refresh token
+export const logoutUser = async (data: LogoutInput, userId: string): Promise<{ message: string }> => {
+  const { refreshToken } = data;
+
+  const stored = await prisma.refreshToken.findUnique({
+    where: { token: refreshToken },
+  });
+
+  if (stored && stored.userId === userId) {
+    await prisma.refreshToken.update({
+      where: { token: refreshToken },
+      data: { revoked: true },
+    });
+  }
+
+  await logAudit('USER_LOGOUT', 'User', userId, userId);
+
+  return { message: 'Logged out successfully' };
 };

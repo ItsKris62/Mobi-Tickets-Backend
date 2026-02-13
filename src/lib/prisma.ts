@@ -1,21 +1,26 @@
 // src/lib/prisma.ts
 import { PrismaClient } from '@prisma/client';
-import { PrismaMariaDb } from '@prisma/adapter-mariadb';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { Pool } from 'pg';
 import { envConfig } from '../config/env';
 
-// Prevent multiple instances in dev (hot-reload safety)
+// Prevent multiple instances during hot reload (dev mode)
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
   prismaPromise: Promise<PrismaClient> | undefined;
 };
 
-// Connection timeout in milliseconds
+// Connection timeout
 const CONNECTION_TIMEOUT_MS = 10000;
 
 /**
- * Helper to add timeout to a promise
+ * Add timeout to a promise
  */
-function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): Promise<T> {
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  errorMessage: string
+): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_, reject) =>
@@ -25,10 +30,9 @@ function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): 
 }
 
 /**
- * Creates and connects the Prisma client with proper timeout and error handling
+ * Create Prisma Client (Prisma 7 compatible)
  */
 async function createPrismaClient(): Promise<PrismaClient> {
-  // Return cached instance if available
   if (globalForPrisma.prisma) {
     return globalForPrisma.prisma;
   }
@@ -36,38 +40,55 @@ async function createPrismaClient(): Promise<PrismaClient> {
   console.log('🔌 Connecting to database...');
 
   try {
-    // Create the MariaDB adapter - it's passed directly to PrismaClient
-    const adapter = new PrismaMariaDb(envConfig.DATABASE_URL);
+    if (!envConfig.DATABASE_URL) {
+      throw new Error('DATABASE_URL is not defined');
+    }
 
-    const client = new PrismaClient({
-      adapter,
-      log: envConfig.NODE_ENV === 'development' ? ['query', 'info', 'warn', 'error'] : ['error'],
+    // Create pg pool
+    const pool = new Pool({
+      connectionString: envConfig.DATABASE_URL,
+      ssl: {
+        rejectUnauthorized: false, // Required for Supabase
+      },
     });
 
-    // Test the connection with a simple query (with timeout)
+    // Create Prisma adapter
+    const adapter = new PrismaPg(pool);
+
+    // Create Prisma client
+    const client = new PrismaClient({
+      adapter,
+      log:
+        envConfig.NODE_ENV === 'development'
+          ? ['query', 'info', 'warn', 'error']
+          : ['error'],
+    });
+
+    // Test connection
     await withTimeout(
       client.$queryRaw`SELECT 1`,
       CONNECTION_TIMEOUT_MS,
-      `Database connection timed out after ${CONNECTION_TIMEOUT_MS}ms. Check if MariaDB/MySQL is running at: ${envConfig.DATABASE_URL.replace(/\/\/[^:]+:[^@]+@/, '//***:***@')}`
+      `Database connection timed out after ${CONNECTION_TIMEOUT_MS}ms`
     );
 
     console.log('✅ Database connected successfully');
 
-    // Cache in development to prevent multiple instances on hot-reload
     if (envConfig.NODE_ENV !== 'production') {
       globalForPrisma.prisma = client;
     }
 
     return client;
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown database error';
+    const errorMessage =
+      error instanceof Error ? error.message : 'Unknown database error';
+
     console.error('❌ Database connection failed:', errorMessage);
     throw new Error(`Failed to connect to database: ${errorMessage}`);
   }
 }
 
 /**
- * Lazily create the Prisma client promise (not at import time)
+ * Lazy initialization
  */
 export function getPrismaPromise(): Promise<PrismaClient> {
   if (!globalForPrisma.prismaPromise) {
@@ -76,11 +97,11 @@ export function getPrismaPromise(): Promise<PrismaClient> {
   return globalForPrisma.prismaPromise;
 }
 
-// For backwards compatibility - lazy initialization
+// Exported instance (after initialization)
 export let prisma: PrismaClient;
 
 /**
- * Initialize Prisma client - call this before starting the server
+ * Initialize Prisma (call before server start)
  */
 export async function initializePrisma(): Promise<PrismaClient> {
   const client = await getPrismaPromise();
@@ -88,9 +109,12 @@ export async function initializePrisma(): Promise<PrismaClient> {
   return client;
 }
 
-// Graceful shutdown
+/**
+ * Graceful shutdown
+ */
 process.on('beforeExit', async () => {
   if (globalForPrisma.prisma) {
+    console.log('🔌 Disconnecting Prisma...');
     await globalForPrisma.prisma.$disconnect();
   }
 });

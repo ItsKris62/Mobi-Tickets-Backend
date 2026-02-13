@@ -6,14 +6,21 @@ import {
   loginSchema,
   refreshSchema,
   walletLoginSchema,
+  resetPasswordSchema,
+  logoutSchema,
   userResponseSchema,
   authResponseSchema,
+  validateTokenResponseSchema,
 } from './auth.schema';
 import {
   registerUser,
+  registerAndLogin,
   loginUser,
   refreshAccessToken,
   walletLogin,
+  requestPasswordReset,
+  validateToken,
+  logoutUser,
 } from './auth.service';
 
 // Error response schema for validation
@@ -24,29 +31,24 @@ const errorResponseSchema = z.object({
 export default async (fastify: FastifyInstance) => {
   const server = fastify.withTypeProvider<ZodTypeProvider>();
 
-  // Register (email/password)
+  // Register (email/password) - auto-login after registration
   server.post(
     '/register',
     {
       schema: {
-        description: 'Register a new user with email and password',
+        description: 'Register a new user with email and password (auto-login)',
         tags: ['auth'],
         body: registerSchema,
         response: {
-          201: userResponseSchema.extend({
-            message: userResponseSchema.shape.id.transform(() => 'User registered successfully'),
-          }).partial({ message: true }),
+          201: authResponseSchema,
           400: errorResponseSchema,
         },
       },
     },
     async (request, reply) => {
       try {
-        const user = await registerUser(request.body, fastify);
-        return reply.status(201).send({
-          message: 'User registered successfully',
-          ...user,
-        });
+        const result = await registerAndLogin(request.body, fastify);
+        return reply.status(201).send(result);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Registration failed';
         return reply.status(400).send({
@@ -133,6 +135,82 @@ export default async (fastify: FastifyInstance) => {
         return reply.status(401).send({
           error: errorMessage,
         });
+      }
+    }
+  );
+
+  // Password reset request
+  server.post(
+    '/reset-password',
+    {
+      schema: {
+        description: 'Request a password reset link',
+        tags: ['auth'],
+        body: resetPasswordSchema,
+        response: {
+          200: z.object({ message: z.string() }),
+          400: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const result = await requestPasswordReset(request.body);
+        return reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Password reset failed';
+        return reply.status(400).send({ error: errorMessage });
+      }
+    }
+  );
+
+  // Validate JWT token
+  server.get(
+    '/validate',
+    {
+      preHandler: [fastify.authenticate],
+      schema: {
+        description: 'Validate current JWT token and return fresh user data',
+        tags: ['auth'],
+        response: {
+          200: validateTokenResponseSchema,
+          401: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const result = await validateToken(request.user!.id);
+        return reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Token validation failed';
+        return reply.status(401).send({ error: errorMessage });
+      }
+    }
+  );
+
+  // Logout (revoke refresh token)
+  server.post(
+    '/logout',
+    {
+      preHandler: [fastify.authenticate],
+      schema: {
+        description: 'Logout and revoke refresh token',
+        tags: ['auth'],
+        body: logoutSchema,
+        response: {
+          200: z.object({ message: z.string() }),
+          400: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const result = await logoutUser(request.body, request.user!.id);
+        return reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Logout failed';
+        return reply.status(400).send({ error: errorMessage });
       }
     }
   );

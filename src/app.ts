@@ -25,6 +25,8 @@ import adminRoutes from './modules/admin/admin.routes';
 import notificationRoutes from './modules/notifications/notification.routes';
 import flashSalesRoutes from './modules/flashsales/flashsales.routes';
 import webhookRoutes from './modules/webhooks/webhooks.routes';
+import organizerRoutes from './modules/organizer/organizer.routes';
+import paymentRoutes from './modules/payments/payments.routes';
 
 // ────────────────────────────────────────────────
 // Create Fastify instance with Zod Type Provider
@@ -148,6 +150,9 @@ fastify.register(usersRoutes,   { prefix: '/api/users' });
 fastify.register(adminRoutes,   { prefix: '/api/admin' });
 fastify.register(notificationRoutes, { prefix: '/api/notifications' });
 fastify.register(flashSalesRoutes, { prefix: '/api/flash-sales' });
+
+fastify.register(organizerRoutes, { prefix: '/api/organizer' });
+fastify.register(paymentRoutes,   { prefix: '/api/payments' });
 
 // QStash Webhook endpoints (for background job processing)
 // These endpoints are called by Upstash QStash, not by users directly

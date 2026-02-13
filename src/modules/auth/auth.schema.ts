@@ -3,8 +3,8 @@ import { z } from 'zod';
 // Role enum for validation
 const roleEnum = z.enum(['ATTENDEE', 'ORGANIZER']);
 
-// Kenyan phone number regex (+254 followed by 9 digits)
-const kenyanPhoneRegex = /^\+254[17]\d{8}$/;
+// Kenyan phone number regex (+254 followed by 9 digits). Strict: cannot start with 0.
+const kenyanPhoneRegex = /^\+254[1-9]\d{8}$/;
 
 // Emergency contact schema
 const emergencyContactSchema = z.object({
@@ -89,5 +89,28 @@ export const authResponseSchema = z.object({
   }),
 });
 
+export const resetPasswordSchema = z.object({
+  email: z.string().email('Invalid email format'),
+});
+
+export const logoutSchema = z.object({
+  refreshToken: z.string().min(1, 'Refresh token is required'),
+});
+
+export const validateTokenResponseSchema = z.object({
+  valid: z.boolean(),
+  user: z.object({
+    id: z.string(),
+    email: z.string(),
+    role: z.string(),
+    fullName: z.string().optional(),
+    avatarUrl: z.string().optional(),
+    isVerified: z.boolean().optional(),
+    isBanned: z.boolean().optional(),
+  }),
+});
+
 export type UserResponse = z.infer<typeof userResponseSchema>;
 export type AuthResponse = z.infer<typeof authResponseSchema>;
+export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
+export type LogoutInput = z.infer<typeof logoutSchema>;

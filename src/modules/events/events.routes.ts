@@ -12,7 +12,9 @@ import {
   postponeEvent,
   cancelEvent,
   publishEvent,
-  getOrganizerEvents
+  getOrganizerEvents,
+  getFeaturedEvents,
+  getEventAttendees,
 } from './events.service';
 import { requireRole } from '../../middleware/rbac';
 
@@ -27,6 +29,19 @@ export default async (fastify: FastifyInstance) => {
   fastify.get('/', async (_request, reply) => {
     const events = await getEvents({ upcoming: true });
     reply.send(events);
+  });
+
+  // Public: Get featured events (must be before /:id)
+  fastify.get('/featured', async (request, reply) => {
+    try {
+      const query = request.query as { limit?: string };
+      const limit = query.limit ? parseInt(query.limit, 10) : 10;
+      const events = await getFeaturedEvents(limit);
+      reply.send(events);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      reply.status(500).send({ error: errorMessage });
+    }
   });
 
   // Organizer/Admin only: Create event with multipart upload
@@ -64,6 +79,29 @@ export default async (fastify: FastifyInstance) => {
       reply.status(404).send({ error: errorMessage });
     }
   });
+
+  // Organizer/Admin: Get event attendees
+  fastify.get(
+    '/:id/attendees',
+    {
+      preHandler: [fastify.authenticate, requireRole(['ORGANIZER', 'ADMIN'])],
+    },
+    async (request, reply) => {
+      try {
+        const { id } = request.params as { id: string };
+        const query = request.query as { page?: string; limit?: string };
+        const page = parseInt(query.page || '1', 10);
+        const limit = parseInt(query.limit || '20', 10);
+        const result = await getEventAttendees(id, request.user!.id, request.user!.role, page, limit);
+        reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        const statusCode = errorMessage.includes('Unauthorized') ? 403 :
+                          errorMessage.includes('not found') ? 404 : 400;
+        reply.status(statusCode).send({ error: errorMessage });
+      }
+    }
+  );
 
   // Organizer/Admin only: Update event
   fastify.put(

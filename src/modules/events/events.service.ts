@@ -412,3 +412,98 @@ export const getOrganizerEvents = async (
     },
   });
 };
+
+// Get featured events
+export const getFeaturedEvents = async (limit = 10) => {
+  return prisma.event.findMany({
+    where: {
+      isFeatured: true,
+      status: 'PUBLISHED',
+      isPublished: true,
+      startTime: { gt: new Date() },
+    },
+    take: limit,
+    orderBy: { featuredAt: 'desc' },
+    include: {
+      organizer: {
+        select: { id: true, fullName: true, email: true },
+      },
+      tickets: {
+        select: {
+          id: true,
+          category: true,
+          name: true,
+          price: true,
+          availableQuantity: true,
+          status: true,
+        },
+      },
+    },
+  });
+};
+
+// Get event attendees (for organizer/admin)
+export const getEventAttendees = async (
+  eventId: string,
+  userId: string,
+  userRole: string,
+  page = 1,
+  limit = 20
+) => {
+  // Check ownership (organizer can only see their own event attendees)
+  const event = await prisma.event.findUnique({
+    where: { id: eventId },
+    select: { organizerId: true, title: true },
+  });
+
+  if (!event) {
+    throw new Error('Event not found');
+  }
+
+  if (event.organizerId !== userId && userRole !== 'ADMIN') {
+    throw new Error('Unauthorized: You can only view attendees of your own events');
+  }
+
+  const skip = (page - 1) * limit;
+
+  const [attendees, total] = await Promise.all([
+    prisma.ticketPurchase.findMany({
+      where: { eventId, status: 'ACTIVE' },
+      skip,
+      take: limit,
+      orderBy: { purchasedAt: 'desc' },
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            phoneNumber: true,
+            avatarUrl: true,
+          },
+        },
+        ticket: {
+          select: {
+            id: true,
+            name: true,
+            category: true,
+            price: true,
+          },
+        },
+      },
+    }),
+    prisma.ticketPurchase.count({
+      where: { eventId, status: 'ACTIVE' },
+    }),
+  ]);
+
+  return {
+    attendees,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  };
+};
