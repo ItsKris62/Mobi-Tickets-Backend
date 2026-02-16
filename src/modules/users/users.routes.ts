@@ -3,6 +3,7 @@ import { updateProfileSchema, addFavoriteSchema, preferencesSchema } from './use
 import {
   getProfile,
   updateProfile,
+  updateAvatar,
   getUserFavorites,
   addFavorite,
   removeFavorite,
@@ -34,6 +35,31 @@ export default async (fastify: FastifyInstance) => {
       const data = request.body as UpdateProfileData;
       const updated = await updateProfile(request.user.id, data);
       reply.send(updated);
+    }
+  );
+
+  // Avatar upload
+  fastify.post(
+    '/me/avatar',
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      try {
+        const file = await request.file();
+        if (!file) {
+          return reply.status(400).send({ error: 'No file uploaded' });
+        }
+
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+        if (!allowedTypes.includes(file.mimetype)) {
+          return reply.status(400).send({ error: 'Invalid file type. Allowed: jpg, png, webp' });
+        }
+
+        const updated = await updateAvatar(request.user.id, file);
+        reply.send(updated);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        reply.status(400).send({ error: errorMessage });
+      }
     }
   );
 

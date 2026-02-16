@@ -27,6 +27,7 @@ import flashSalesRoutes from './modules/flashsales/flashsales.routes';
 import webhookRoutes from './modules/webhooks/webhooks.routes';
 import organizerRoutes from './modules/organizer/organizer.routes';
 import paymentRoutes from './modules/payments/payments.routes';
+import alertsRoutes from './modules/alerts/alerts.routes';
 
 // ────────────────────────────────────────────────
 // Create Fastify instance with Zod Type Provider
@@ -98,7 +99,7 @@ fastify.register(jwt, {
 fastify.register(multipart, {
   limits: {
     fileSize: 10 * 1024 * 1024, // 10MB max
-    files: 2, // max 2 files per request (poster + trailer)
+    files: 3, // max 3 files per request (poster + trailer + additional)
   },
 });
 
@@ -153,6 +154,7 @@ fastify.register(flashSalesRoutes, { prefix: '/api/flash-sales' });
 
 fastify.register(organizerRoutes, { prefix: '/api/organizer' });
 fastify.register(paymentRoutes,   { prefix: '/api/payments' });
+fastify.register(alertsRoutes,    { prefix: '/api/admin/alerts' });
 
 // QStash Webhook endpoints (for background job processing)
 // These endpoints are called by Upstash QStash, not by users directly

@@ -2,6 +2,15 @@ import { prisma } from '../../lib/prisma';
 import { redis } from '../../lib/redis';
 import { logAudit } from '../../lib/audit';
 import { createNotification } from '../notifications/notification.service';
+import {
+  mapUserToFrontend,
+  mapAuditLogToFrontend,
+  mapEventToFrontend,
+  mapOrganizerRequestToFrontend,
+  mapRefundRequestToFrontend,
+} from '../../lib/response-mappers';
+import { cancelEvent } from '../events/events.service';
+import { createSystemAlert } from '../alerts/alerts.service';
 
 export const getDashboardStats = async () => {
   const [totalEvents, totalUsers, recentOrders, totalRevenue] = await Promise.all([
@@ -22,12 +31,28 @@ export const getDashboardStats = async () => {
   };
 };
 
-// Get all users with pagination
-export const getAllUsers = async (page = 1, limit = 20) => {
+// Get all users with pagination, search, and role filtering
+export const getAllUsers = async (
+  page = 1,
+  limit = 20,
+  options?: { search?: string; role?: string }
+) => {
   const skip = (page - 1) * limit;
+
+  const where: any = {};
+  if (options?.role && options.role !== 'all') {
+    where.role = options.role.toUpperCase();
+  }
+  if (options?.search) {
+    where.OR = [
+      { fullName: { contains: options.search, mode: 'insensitive' } },
+      { email: { contains: options.search, mode: 'insensitive' } },
+    ];
+  }
 
   const [users, total] = await Promise.all([
     prisma.user.findMany({
+      where,
       skip,
       take: limit,
       orderBy: { createdAt: 'desc' },
@@ -37,14 +62,23 @@ export const getAllUsers = async (page = 1, limit = 20) => {
         fullName: true,
         role: true,
         createdAt: true,
+        updatedAt: true,
         avatarUrl: true,
+        phoneNumber: true,
+        isBanned: true,
+        isActive: true,
+        dateOfBirth: true,
+        idNumber: true,
+        county: true,
+        city: true,
+        emergencyContact: true,
       },
     }),
-    prisma.user.count(),
+    prisma.user.count({ where }),
   ]);
 
   return {
-    users,
+    users: users.map(mapUserToFrontend),
     pagination: {
       page,
       limit,
@@ -68,15 +102,65 @@ export const banUser = async (userId: string, adminId: string, reason: string) =
 
   await logAudit('USER_BANNED', 'User', userId, adminId, { reason });
 
-  return { message: 'User banned successfully' };
+  // Auto-generate system alert
+  await createSystemAlert(
+    'user',
+    'medium',
+    'User Banned',
+    `User ${userId} was banned. Reason: ${reason}`,
+    { userId, reason, bannedBy: adminId }
+  );
+
+  return { message: 'User banned successfully', success: true };
 };
 
-// Get all events for moderation
+// Unban user
+export const unbanUser = async (userId: string, adminId: string) => {
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      isBanned: false,
+      bannedAt: null,
+      bannedReason: null,
+      isActive: true,
+    },
+  });
+
+  await logAudit('USER_UNBANNED', 'User', userId, adminId);
+
+  return { message: 'User unbanned successfully', success: true };
+};
+
+// Change user role
+export const changeUserRole = async (
+  userId: string,
+  newRole: 'ATTENDEE' | 'ORGANIZER' | 'ADMIN',
+  adminId: string
+) => {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { role: true } });
+  if (!user) throw new Error('User not found');
+
+  const oldRole = user.role;
+  await prisma.user.update({
+    where: { id: userId },
+    data: { role: newRole },
+  });
+
+  await logAudit('USER_ROLE_CHANGED', 'User', userId, adminId, {
+    oldRole,
+    newRole,
+  });
+
+  return { message: `User role changed to ${newRole}`, success: true };
+};
+
+// Get all events for moderation (with tickets + organizer for frontend mapping)
 export const getAllEvents = async (page = 1, limit = 20) => {
   const skip = (page - 1) * limit;
 
   const [events, total] = await Promise.all([
     prisma.event.findMany({
+      where: { deletedAt: null },
       skip,
       take: limit,
       orderBy: { createdAt: 'desc' },
@@ -88,13 +172,23 @@ export const getAllEvents = async (page = 1, limit = 20) => {
             email: true,
           },
         },
+        tickets: {
+          select: {
+            id: true,
+            category: true,
+            name: true,
+            price: true,
+            totalQuantity: true,
+            availableQuantity: true,
+          },
+        },
       },
     }),
-    prisma.event.count(),
+    prisma.event.count({ where: { deletedAt: null } }),
   ]);
 
   return {
-    events,
+    events: events.map(mapEventToFrontend),
     pagination: {
       page,
       limit,
@@ -104,12 +198,44 @@ export const getAllEvents = async (page = 1, limit = 20) => {
   };
 };
 
-// Get audit logs
-export const getAuditLogs = async (page = 1, limit = 50) => {
+// Get audit logs with optional type filter
+export const getAuditLogs = async (
+  page = 1,
+  limit = 50,
+  options?: { type?: string; search?: string }
+) => {
   const skip = (page - 1) * limit;
+
+  const where: any = {};
+
+  // Filter by derived type (map type back to action patterns)
+  if (options?.type && options.type !== 'all') {
+    const typeActionMap: Record<string, string[]> = {
+      warning: ['BANNED', 'CANCELLED', 'REJECTED', 'SUSPENDED'],
+      error: ['FAILED', 'ERROR', 'DENIED'],
+      success: ['CREATED', 'APPROVED', 'PUBLISHED', 'COMPLETED', 'UNBANNED'],
+      info: [], // default — we'll handle this differently
+    };
+
+    const patterns = typeActionMap[options.type];
+    if (patterns && patterns.length > 0) {
+      where.OR = patterns.map((p) => ({ action: { contains: p } }));
+    } else if (options.type === 'info') {
+      // Info = NOT matching any of the other patterns
+      const excludePatterns = [
+        ...(typeActionMap.warning || []),
+        ...(typeActionMap.error || []),
+        ...(typeActionMap.success || []),
+      ];
+      where.AND = excludePatterns.map((p) => ({
+        action: { not: { contains: p } },
+      }));
+    }
+  }
 
   const [logs, total] = await Promise.all([
     prisma.auditLog.findMany({
+      where,
       skip,
       take: limit,
       orderBy: { createdAt: 'desc' },
@@ -123,11 +249,11 @@ export const getAuditLogs = async (page = 1, limit = 50) => {
         },
       },
     }),
-    prisma.auditLog.count(),
+    prisma.auditLog.count({ where }),
   ]);
 
   return {
-    logs,
+    logs: logs.map(mapAuditLogToFrontend),
     pagination: {
       page,
       limit,
@@ -135,6 +261,55 @@ export const getAuditLogs = async (page = 1, limit = 50) => {
       totalPages: Math.ceil(total / limit),
     },
   };
+};
+
+// Export audit logs as CSV or JSON
+export const exportAuditLogs = async (
+  format: 'csv' | 'json' = 'csv',
+  options?: { type?: string; startDate?: string; endDate?: string }
+) => {
+  const where: any = {};
+
+  if (options?.startDate) {
+    where.createdAt = { ...where.createdAt, gte: new Date(options.startDate) };
+  }
+  if (options?.endDate) {
+    where.createdAt = { ...where.createdAt, lte: new Date(options.endDate) };
+  }
+
+  const logs = await prisma.auditLog.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    take: 10000, // reasonable upper limit
+    include: {
+      user: {
+        select: { id: true, email: true, fullName: true },
+      },
+    },
+  });
+
+  const mapped = logs.map(mapAuditLogToFrontend);
+
+  if (format === 'json') {
+    return JSON.stringify(mapped, null, 2);
+  }
+
+  // CSV format
+  const headers = ['ID', 'Timestamp', 'Type', 'Action', 'Entity', 'EntityID', 'User', 'IP', 'Status', 'Message'];
+  const rows = mapped.map((l) =>
+    [l.id, l.timestamp, l.type, l.action, l.entity, l.entityId, l.user || '', l.ipAddress, l.status, `"${l.message.replace(/"/g, '""')}"`].join(',')
+  );
+
+  return [headers.join(','), ...rows].join('\n');
+};
+
+// Admin cancel event (delegates to events.service.cancelEvent)
+export const adminCancelEvent = async (
+  eventId: string,
+  reason: string,
+  adminId: string
+) => {
+  return cancelEvent(eventId, adminId, 'ADMIN', reason);
 };
 
 // System health check
@@ -172,23 +347,6 @@ export const getSystemHealth = async () => {
       rss: Math.round(memoryUsage.rss / 1024 / 1024),
     },
   };
-};
-
-// Unban user
-export const unbanUser = async (userId: string, adminId: string) => {
-  await prisma.user.update({
-    where: { id: userId },
-    data: {
-      isBanned: false,
-      bannedAt: null,
-      bannedReason: null,
-      isActive: true,
-    },
-  });
-
-  await logAudit('USER_UNBANNED', 'User', userId, adminId);
-
-  return { message: 'User unbanned successfully' };
 };
 
 // Toggle featured event
@@ -241,7 +399,7 @@ export const getOrganizerRequests = async (page = 1, limit = 20) => {
   ]);
 
   return {
-    requests,
+    requests: requests.map(mapOrganizerRequestToFrontend),
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   };
 };
@@ -333,7 +491,7 @@ export const getRefundRequests = async (page = 1, limit = 20) => {
   ]);
 
   return {
-    requests,
+    requests: requests.map(mapRefundRequestToFrontend),
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   };
 };

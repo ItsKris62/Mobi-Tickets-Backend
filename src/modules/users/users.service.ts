@@ -1,5 +1,7 @@
 import { prisma } from '../../lib/prisma';
 import { Prisma } from '@prisma/client';
+import { MultipartFile } from '@fastify/multipart';
+import { uploadUserAvatar, deleteFromCloudinary, extractPublicId } from '../../lib/cloudinary';
 
 export const getProfile = async (userId: string) => {
   return prisma.user.findUnique({
@@ -13,6 +15,36 @@ export const updateProfile = async (userId: string, data: { fullName?: string; b
     where: { id: userId },
     data,
     select: { id: true, fullName: true, bio: true },
+  });
+};
+
+export const updateAvatar = async (userId: string, file: MultipartFile) => {
+  // Get current user to check for existing avatar
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { avatarUrl: true },
+  });
+
+  // Delete old avatar from Cloudinary if it exists
+  if (user?.avatarUrl) {
+    const publicId = extractPublicId(user.avatarUrl);
+    if (publicId) {
+      try {
+        await deleteFromCloudinary(publicId);
+      } catch {
+        // Non-critical — old file cleanup failed, proceed with upload
+      }
+    }
+  }
+
+  // Upload new avatar
+  const avatarUrl = await uploadUserAvatar(file);
+
+  // Update user record
+  return prisma.user.update({
+    where: { id: userId },
+    data: { avatarUrl },
+    select: { id: true, email: true, fullName: true, bio: true, avatarUrl: true, role: true },
   });
 };
 

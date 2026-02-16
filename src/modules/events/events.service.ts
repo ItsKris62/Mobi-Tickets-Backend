@@ -4,6 +4,7 @@ import { CreateEventInput } from './events.schema';
 import { MultipartFile } from '@fastify/multipart';
 import { notifyEventAttendees, notifyAdmins } from '../notifications/notification.service';
 import { logAudit } from '../../lib/audit';
+import { createSystemAlert } from '../alerts/alerts.service';
 
 export const createEvent = async (
   data: CreateEventInput,
@@ -30,7 +31,10 @@ export const createEvent = async (
 
 export const getEvents = async (query: { upcoming?: boolean }) => {
   return prisma.event.findMany({
-    where: query.upcoming ? { startTime: { gt: new Date() }, isPublished: true } : undefined,
+    where: {
+      deletedAt: null,
+      ...(query.upcoming ? { startTime: { gt: new Date() }, isPublished: true } : {}),
+    },
     orderBy: { startTime: 'asc' },
     include: {
       organizer: {
@@ -43,8 +47,10 @@ export const getEvents = async (query: { upcoming?: boolean }) => {
       tickets: {
         select: {
           id: true,
-          type: true,
+          category: true,
+          name: true,
           price: true,
+          totalQuantity: true,
           availableQuantity: true,
           status: true,
         },
@@ -54,8 +60,8 @@ export const getEvents = async (query: { upcoming?: boolean }) => {
 };
 
 export const getEventById = async (eventId: string) => {
-  const event = await prisma.event.findUnique({
-    where: { id: eventId },
+  const event = await prisma.event.findFirst({
+    where: { id: eventId, deletedAt: null },
     include: {
       organizer: {
         select: {
@@ -67,7 +73,8 @@ export const getEventById = async (eventId: string) => {
       tickets: {
         select: {
           id: true,
-          type: true,
+          category: true,
+          name: true,
           price: true,
           totalQuantity: true,
           availableQuantity: true,
@@ -128,8 +135,8 @@ export const deleteEvent = async (
   userRole: string
 ) => {
   // Check ownership
-  const event = await prisma.event.findUnique({
-    where: { id: eventId },
+  const event = await prisma.event.findFirst({
+    where: { id: eventId, deletedAt: null },
     select: { organizerId: true },
   });
 
@@ -141,8 +148,10 @@ export const deleteEvent = async (
     throw new Error('Unauthorized: You can only delete your own events');
   }
 
-  await prisma.event.delete({
+  // Soft delete
+  await prisma.event.update({
     where: { id: eventId },
+    data: { deletedAt: new Date() },
   });
 
   return { message: 'Event deleted successfully' };
@@ -324,6 +333,15 @@ export const cancelEvent = async (
     attendeesNotified: notifiedCount,
   });
 
+  // Auto-generate system alert
+  await createSystemAlert(
+    'event',
+    'high',
+    `Event Cancelled: ${event.title}`,
+    `Event "${event.title}" was cancelled. Reason: ${reason}. ${notifiedCount} attendees notified.`,
+    { eventId, organizerName: event.organizer.fullName, reason, attendeesNotified: notifiedCount }
+  );
+
   return {
     event: updatedEvent,
     attendeesNotified: notifiedCount,
@@ -390,6 +408,7 @@ export const getOrganizerEvents = async (
   return prisma.event.findMany({
     where: {
       organizerId,
+      deletedAt: null,
       ...(status && { status: status as any }),
     },
     orderBy: { createdAt: 'desc' },
@@ -420,6 +439,7 @@ export const getFeaturedEvents = async (limit = 10) => {
       isFeatured: true,
       status: 'PUBLISHED',
       isPublished: true,
+      deletedAt: null,
       startTime: { gt: new Date() },
     },
     take: limit,

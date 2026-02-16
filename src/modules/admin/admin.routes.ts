@@ -13,6 +13,9 @@ import {
   reviewOrganizerRequest,
   getRefundRequests,
   reviewRefundRequest,
+  changeUserRole,
+  exportAuditLogs,
+  adminCancelEvent,
 } from './admin.service';
 import { featureEventSchema, reviewRequestSchema } from './admin.schema';
 
@@ -32,16 +35,24 @@ export default async (fastify: FastifyInstance) => {
     }
   );
 
-  // Get all users with pagination
+  // Get all users with pagination, search, and role filtering
   fastify.get(
     '/users',
     { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
     async (request, reply) => {
       try {
-        const query = request.query as { page?: string; limit?: string };
+        const query = request.query as {
+          page?: string;
+          limit?: string;
+          search?: string;
+          role?: string;
+        };
         const page = parseInt(query.page || '1', 10);
-        const limit = parseInt(query.limit || '20', 10);
-        const result = await getAllUsers(page, limit);
+        const limit = parseInt(query.limit || '100', 10);
+        const result = await getAllUsers(page, limit, {
+          search: query.search,
+          role: query.role,
+        });
         reply.send(result);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -50,7 +61,7 @@ export default async (fastify: FastifyInstance) => {
     }
   );
 
-  // Ban user
+  // Ban user (legacy POST endpoint)
   fastify.post(
     '/users/:userId/ban',
     { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
@@ -67,6 +78,61 @@ export default async (fastify: FastifyInstance) => {
     }
   );
 
+  // Unban user (legacy DELETE endpoint)
+  fastify.delete(
+    '/users/:userId/ban',
+    { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
+    async (request, reply) => {
+      try {
+        const { userId } = request.params as { userId: string };
+        const result = await unbanUser(userId, request.user!.id);
+        reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        reply.status(400).send({ error: errorMessage });
+      }
+    }
+  );
+
+  // Toggle ban/unban (PUT endpoint - what the frontend uses)
+  fastify.put(
+    '/users/:userId/ban',
+    { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
+    async (request, reply) => {
+      try {
+        const { userId } = request.params as { userId: string };
+        const { banned, reason } = request.body as { banned: boolean; reason?: string };
+
+        const result = banned
+          ? await banUser(userId, request.user!.id, reason || 'Admin action')
+          : await unbanUser(userId, request.user!.id);
+
+        reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        reply.status(400).send({ error: errorMessage });
+      }
+    }
+  );
+
+  // Change user role
+  fastify.put(
+    '/users/:userId/role',
+    { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
+    async (request, reply) => {
+      try {
+        const { userId } = request.params as { userId: string };
+        const { role } = request.body as { role: 'ATTENDEE' | 'ORGANIZER' | 'ADMIN' };
+        const result = await changeUserRole(userId, role, request.user!.id);
+        reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        const statusCode = (errorMessage).includes('not found') ? 404 : 400;
+        reply.status(statusCode).send({ error: errorMessage });
+      }
+    }
+  );
+
   // Get all events for moderation
   fastify.get(
     '/events',
@@ -75,7 +141,7 @@ export default async (fastify: FastifyInstance) => {
       try {
         const query = request.query as { page?: string; limit?: string };
         const page = parseInt(query.page || '1', 10);
-        const limit = parseInt(query.limit || '20', 10);
+        const limit = parseInt(query.limit || '50', 10);
         const result = await getAllEvents(page, limit);
         reply.send(result);
       } catch (error) {
@@ -85,20 +151,83 @@ export default async (fastify: FastifyInstance) => {
     }
   );
 
-  // Get audit logs
+  // Get audit logs with optional filtering
   fastify.get(
     '/logs',
     { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
     async (request, reply) => {
       try {
-        const query = request.query as { page?: string; limit?: string };
+        const query = request.query as {
+          page?: string;
+          limit?: string;
+          type?: string;
+          search?: string;
+        };
         const page = parseInt(query.page || '1', 10);
-        const limit = parseInt(query.limit || '50', 10);
-        const result = await getAuditLogs(page, limit);
+        const limit = parseInt(query.limit || '100', 10);
+        const result = await getAuditLogs(page, limit, {
+          type: query.type,
+          search: query.search,
+        });
         reply.send(result);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
         reply.status(500).send({ error: errorMessage });
+      }
+    }
+  );
+
+  // Export audit logs as CSV or JSON
+  fastify.get(
+    '/logs/export',
+    { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
+    async (request, reply) => {
+      try {
+        const query = request.query as {
+          format?: string;
+          startDate?: string;
+          endDate?: string;
+          type?: string;
+        };
+        const format = (query.format === 'json' ? 'json' : 'csv') as 'csv' | 'json';
+        const data = await exportAuditLogs(format, {
+          type: query.type,
+          startDate: query.startDate,
+          endDate: query.endDate,
+        });
+
+        if (format === 'json') {
+          reply
+            .header('Content-Type', 'application/json')
+            .header('Content-Disposition', 'attachment; filename="logs.json"')
+            .send(data);
+        } else {
+          reply
+            .header('Content-Type', 'text/csv')
+            .header('Content-Disposition', 'attachment; filename="logs.csv"')
+            .send(data);
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        reply.status(500).send({ error: errorMessage });
+      }
+    }
+  );
+
+  // Admin cancel event
+  fastify.post(
+    '/events/:eventId/cancel',
+    { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
+    async (request, reply) => {
+      try {
+        const { eventId } = request.params as { eventId: string };
+        const { reason } = request.body as { reason: string };
+        const result = await adminCancelEvent(eventId, reason, request.user!.id);
+        reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        const statusCode = (errorMessage).includes('not found') ? 404 : 400;
+        reply.status(statusCode).send({ error: errorMessage });
       }
     }
   );
@@ -114,22 +243,6 @@ export default async (fastify: FastifyInstance) => {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
         reply.status(500).send({ error: errorMessage });
-      }
-    }
-  );
-
-  // Unban user
-  fastify.delete(
-    '/users/:userId/ban',
-    { preHandler: [fastify.authenticate, requireRole(['ADMIN'])] },
-    async (request, reply) => {
-      try {
-        const { userId } = request.params as { userId: string };
-        const result = await unbanUser(userId, request.user!.id);
-        reply.send(result);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        reply.status(400).send({ error: errorMessage });
       }
     }
   );

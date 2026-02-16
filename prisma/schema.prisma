@@ -136,6 +136,9 @@ model Event {
   category            String?       // Music, Sports, Conference, etc.
   tags                Json?         // Tags for search (stored as JSON array)
 
+  // Soft delete
+  deletedAt           DateTime?
+
   createdAt           DateTime      @default(now())
   updatedAt           DateTime      @updatedAt
 
@@ -479,4 +482,28 @@ model RefundRequest {
   @@index([orderId])
   @@index([status])
   @@map("refund_requests")
+}
+
+// System alerts for admin monitoring
+model Alert {
+  id              String    @id @default(uuid()) @db.VarChar(36)
+  type            String    // security, system, user, payment, event
+  severity        String    // critical, high, medium, low
+  title           String
+  message         String
+  status          String    @default("active") // active, acknowledged, resolved
+  source          String?   // what triggered the alert
+  metadata        Json?     // additional context data
+  resolvedBy      String?   @db.VarChar(36)
+  resolvedAt      DateTime?
+  acknowledgedBy  String?   @db.VarChar(36)
+  acknowledgedAt  DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([type])
+  @@index([severity])
+  @@index([status])
+  @@index([createdAt])
+  @@map("alerts")
 }
