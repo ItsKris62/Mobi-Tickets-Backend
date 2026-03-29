@@ -4,6 +4,7 @@ import {
   initiatePayment,
   handleMpesaCallback,
   getPaymentStatus,
+  confirmDummyPayment,
 } from './payments.service';
 
 export default async (fastify: FastifyInstance) => {
@@ -53,6 +54,24 @@ export default async (fastify: FastifyInstance) => {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
         fastify.log.error({ err: errorMessage }, 'M-Pesa callback error');
         reply.status(200).send({ message: 'Callback received' }); // Always return 200 to M-Pesa
+      }
+    }
+  );
+
+  // Confirm dummy payment (non-MPESA, dev/demo mode)
+  fastify.post(
+    '/dummy-confirm/:transactionId',
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      try {
+        const { transactionId } = request.params as { transactionId: string };
+        const result = await confirmDummyPayment(transactionId, request.user!.id);
+        reply.send(result);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        const statusCode = errorMessage.includes('Unauthorized') ? 403 :
+                          errorMessage.includes('not found') ? 404 : 400;
+        reply.status(statusCode).send({ error: errorMessage });
       }
     }
   );

@@ -1,6 +1,6 @@
 import { prisma } from '../../lib/prisma';
-import { NotificationType } from '@prisma/client';
-import { emailQueue } from '../../lib/queue';
+import { NotificationType, Prisma } from '@prisma/client';
+import { sendEmail as queueEmailJob } from '../../lib/queue';
 
 // SSE sender function (injected from app.ts to avoid circular dependency)
 let sseSender: ((userId: string, data: Record<string, unknown>) => void) | null = null;
@@ -52,7 +52,7 @@ export const createNotification = async (input: CreateNotificationInput) => {
       type: input.type,
       title: input.title,
       message: input.message,
-      data: input.data,
+      data: (input.data ?? Prisma.DbNull) as Prisma.InputJsonValue,
     },
   });
 
@@ -75,7 +75,7 @@ export const createBulkNotifications = async (input: BulkNotificationInput) => {
     type: input.type,
     title: input.title,
     message: input.message,
-    data: input.data,
+    data: (input.data ?? Prisma.DbNull) as Prisma.InputJsonValue,
   }));
 
   const result = await prisma.notification.createMany({
@@ -214,16 +214,18 @@ export const notifyEventAttendees = async (
       data,
     });
 
-    // Queue email notifications
+    // Queue email notifications via QStash
     if (sendEmail) {
       for (const order of orders) {
-        await emailQueue.add('notification-email', {
-          to: order.user.email,
-          subject: title,
-          body: message,
-          userName: order.user.fullName || 'Valued Customer',
-          data,
-        });
+        try {
+          await queueEmailJob({
+            to: order.user.email,
+            subject: title,
+            text: message,
+          });
+        } catch {
+          // Non-critical: don't fail if email queueing fails
+        }
       }
     }
   }

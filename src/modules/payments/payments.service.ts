@@ -155,6 +155,66 @@ export const handleMpesaCallback = async (callbackData: {
   return { message: 'Callback processed' };
 };
 
+// Confirm a dummy (non-MPESA) payment — immediately marks transaction + order as completed
+export const confirmDummyPayment = async (transactionId: string, userId: string) => {
+  const transaction = await prisma.transaction.findUnique({
+    where: { id: transactionId },
+    include: {
+      order: true,
+    },
+  });
+
+  if (!transaction) {
+    throw new Error('Transaction not found');
+  }
+
+  if (transaction.order.userId !== userId) {
+    throw new Error('Unauthorized: This is not your transaction');
+  }
+
+  if (transaction.status === 'COMPLETED') {
+    throw new Error('Payment already completed');
+  }
+
+  if (transaction.order.status !== 'PENDING') {
+    throw new Error(`Cannot confirm payment for order with status: ${transaction.order.status}`);
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.transaction.update({
+      where: { id: transactionId },
+      data: { status: 'COMPLETED' },
+    });
+
+    await tx.order.update({
+      where: { id: transaction.orderId },
+      data: { status: 'PAID' },
+    });
+  });
+
+  await createNotification({
+    userId,
+    eventId: transaction.order.eventId,
+    type: 'TICKET_PURCHASE',
+    title: 'Payment Confirmed',
+    message: `Your payment of KES ${transaction.amount.toLocaleString()} has been confirmed. Order #${transaction.orderId.slice(0, 8).toUpperCase()}`,
+    data: { transactionId, orderId: transaction.orderId },
+  });
+
+  await logAudit('PAYMENT_COMPLETED', 'Transaction', transactionId, userId, {
+    method: 'DUMMY',
+    amount: transaction.amount,
+    orderId: transaction.orderId,
+  });
+
+  return {
+    success: true,
+    transactionId,
+    orderId: transaction.orderId,
+    amount: transaction.amount,
+  };
+};
+
 // Get payment status
 export const getPaymentStatus = async (transactionId: string, userId: string) => {
   const transaction = await prisma.transaction.findUnique({

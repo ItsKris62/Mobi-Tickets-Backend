@@ -18,11 +18,14 @@ export const logAudit = async (
         entity,
         entityId,
         userId,
-        data: data ? JSON.stringify(data) : Prisma.DbNull,
+        data: data ?? Prisma.DbNull,
         ipAddress: request?.ip,
       },
     });
   } catch (err) {
-    console.error('Audit log failed:', err); // Fallback: never block main flow
+    // Fallback: never block main flow — audit failures are non-critical
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Audit log failed:', err);
+    }
   }
 };

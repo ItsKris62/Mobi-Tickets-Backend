@@ -2,7 +2,8 @@
 import { prisma } from '../../lib/prisma';
 import * as QRCode from 'qrcode';
 import { logAudit } from '../../lib/audit';
-import { emailQueue, nftQueue } from '../../lib/queue'; // From earlier BullMQ setup
+import { sendTicketConfirmationEmail } from '../../lib/queue';
+import { createNotification } from '../notifications/notification.service';
 
 // Purchase tickets (transaction-safe to prevent oversell)
 export const purchaseTickets = async (
@@ -52,26 +53,44 @@ export const purchaseTickets = async (
     // Generate QR
     const qrCode = await generateTicketQR(ticketId, order.id);
 
-    // Get user email for confirmation
+    // Get user and event info for confirmation
     const user = await tx.user.findUnique({
       where: { id: userId },
-      select: { email: true },
+      select: { email: true, fullName: true },
     });
 
-    // Queue async jobs (email confirmation + NFT mint)
-    if (user) {
-      await emailQueue.add('send-confirmation', {
-        to: user.email,
-        subject: 'MobiTickets Purchase Confirmation',
-        text: `Order ${order.id} confirmed! QR: ${qrCode}`,
-        orderId: order.id,
-      });
+    const event = await tx.event.findUnique({
+      where: { id: ticket.eventId },
+      select: { title: true },
+    });
+
+    // Queue email confirmation via QStash
+    if (user?.email && event) {
+      try {
+        await sendTicketConfirmationEmail(
+          user.email,
+          order.id,
+          event.title,
+          quantity
+        );
+      } catch (err) {
+        // Non-critical: don't fail the purchase if email queueing fails
+      }
     }
 
-    await nftQueue.add('mint-nft', {
-      ticketId,
-      userAddress: '0x...', // From wallet context if available
-    });
+    // Create in-app notification
+    try {
+      await createNotification({
+        userId,
+        eventId: ticket.eventId,
+        type: 'TICKET_PURCHASE',
+        title: '🎫 Ticket Purchase Confirmed',
+        message: `You purchased ${quantity} ticket(s) for "${event?.title || 'an event'}". Order ID: ${order.id}`,
+        data: { orderId: order.id, ticketId, quantity },
+      });
+    } catch {
+      // Non-critical
+    }
 
     await logAudit('TICKET_PURCHASED', 'Order', order.id, userId, { ticketId, quantity });
 
@@ -98,7 +117,9 @@ export const getUserTickets = async (userId: string) => {
         include: {
           ticket: {
             select: {
-              type: true,
+              id: true,
+              category: true,
+              name: true,
               price: true,
             },
           },

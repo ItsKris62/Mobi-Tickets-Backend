@@ -233,6 +233,7 @@ export interface FrontendEvent {
   organizerId: string;
   organizerName: string;
   ticketTypes: string[];
+  ticketIds: Record<string, string>;
   pricing: Record<string, number>;
   capacity: Record<string, number>;
   sold: Record<string, number>;
@@ -248,10 +249,12 @@ export function mapEventToFrontend(event: PrismaEventInput): FrontendEvent {
   const capacity: Record<string, number> = {};
   const sold: Record<string, number> = {};
   const ticketTypes: string[] = [];
+  const ticketIds: Record<string, string> = {};
 
   for (const ticket of tickets) {
     const cat = ticket.category.toLowerCase();
     ticketTypes.push(cat);
+    ticketIds[cat] = ticket.id;
     pricing[cat] = Number(ticket.price) || 0;
     capacity[cat] = ticket.totalQuantity;
     sold[cat] = ticket.totalQuantity - ticket.availableQuantity;
@@ -290,6 +293,7 @@ export function mapEventToFrontend(event: PrismaEventInput): FrontendEvent {
     organizerId: event.organizerId,
     organizerName: event.organizer?.fullName || event.organizer?.email || '',
     ticketTypes,
+    ticketIds,
     pricing,
     capacity,
     sold,

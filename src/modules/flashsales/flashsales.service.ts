@@ -118,20 +118,14 @@ export const getEventFlashSales = async (
 export const getActiveFlashSales = async (eventId: string) => {
   const now = new Date();
 
-  return prisma.flashSale.findMany({
+  // Fetch active flash sales and filter max redemptions in application layer
+  // since Prisma doesn't support field-to-field comparison in where clauses
+  const flashSales = await prisma.flashSale.findMany({
     where: {
       eventId,
       isActive: true,
       startTime: { lte: now },
       endTime: { gte: now },
-      OR: [
-        { maxRedemptions: null },
-        {
-          maxRedemptions: {
-            gt: prisma.flashSale.fields.currentRedemptions,
-          },
-        },
-      ],
     },
     select: {
       id: true,
@@ -143,7 +137,15 @@ export const getActiveFlashSales = async (eventId: string) => {
       endTime: true,
       ticketCategories: true,
       promoCode: true,
+      maxRedemptions: true,
+      currentRedemptions: true,
     },
+  });
+
+  // Filter out flash sales that have reached max redemptions
+  return flashSales.filter((fs) => {
+    if (fs.maxRedemptions === null) return true;
+    return fs.currentRedemptions < fs.maxRedemptions;
   });
 };
 
@@ -235,7 +237,8 @@ export const validatePromoCode = async (
   }
 
   // Check if ticket category applies
-  if (flashSale.ticketCategories.length > 0 && !flashSale.ticketCategories.includes(ticketCategory)) {
+  const categories = (flashSale.ticketCategories as TicketCategory[] | null) || [];
+  if (categories.length > 0 && !categories.includes(ticketCategory)) {
     throw new Error('This promo code does not apply to the selected ticket category');
   }
 

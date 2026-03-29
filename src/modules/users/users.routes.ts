@@ -23,7 +23,7 @@ export default async (fastify: FastifyInstance) => {
     '/me',
     { preHandler: [fastify.authenticate] },
     async (request, reply) => {
-      const profile = await getProfile(request.user.id);
+      const profile = await getProfile(request.user!.id);
       reply.send(profile);
     }
   );
@@ -33,7 +33,7 @@ export default async (fastify: FastifyInstance) => {
     { schema: updateProfileSchema, preHandler: [fastify.authenticate] },
     async (request, reply) => {
       const data = request.body as UpdateProfileData;
-      const updated = await updateProfile(request.user.id, data);
+      const updated = await updateProfile(request.user!.id, data);
       reply.send(updated);
     }
   );
@@ -54,7 +54,7 @@ export default async (fastify: FastifyInstance) => {
           return reply.status(400).send({ error: 'Invalid file type. Allowed: jpg, png, webp' });
         }
 
-        const updated = await updateAvatar(request.user.id, file);
+        const updated = await updateAvatar(request.user!.id, file);
         reply.send(updated);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -72,7 +72,7 @@ export default async (fastify: FastifyInstance) => {
         const query = request.query as { page?: string; limit?: string };
         const page = parseInt(query.page || '1', 10);
         const limit = parseInt(query.limit || '20', 10);
-        const result = await getUserFavorites(request.user.id, page, limit);
+        const result = await getUserFavorites(request.user!.id, page, limit);
         reply.send(result);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -87,7 +87,7 @@ export default async (fastify: FastifyInstance) => {
     async (request, reply) => {
       try {
         const { eventId } = request.body as { eventId: string };
-        const result = await addFavorite(request.user.id, eventId);
+        const result = await addFavorite(request.user!.id, eventId);
         reply.status(201).send(result);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -103,7 +103,7 @@ export default async (fastify: FastifyInstance) => {
     async (request, reply) => {
       try {
         const { eventId } = request.params as { eventId: string };
-        const result = await removeFavorite(request.user.id, eventId);
+        const result = await removeFavorite(request.user!.id, eventId);
         reply.send(result);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -119,7 +119,7 @@ export default async (fastify: FastifyInstance) => {
     { preHandler: [fastify.authenticate] },
     async (request, reply) => {
       try {
-        const prefs = await getUserPreferences(request.user.id);
+        const prefs = await getUserPreferences(request.user!.id);
         reply.send(prefs);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -134,7 +134,7 @@ export default async (fastify: FastifyInstance) => {
     async (request, reply) => {
       try {
         const data = request.body as { notifications?: boolean; language?: string; theme?: string };
-        const updated = await updateUserPreferences(request.user.id, data);
+        const updated = await updateUserPreferences(request.user!.id, data);
         reply.send(updated);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
