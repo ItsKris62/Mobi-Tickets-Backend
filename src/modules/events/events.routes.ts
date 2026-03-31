@@ -2,7 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { MultipartFile } from '@fastify/multipart';
 import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
-import { createEventSchema, CreateEventInput } from './events.schema';
+import { createEventSchema, CreateEventInput, getEventsQuerySchema } from './events.schema';
 import {
   createEvent,
   getEvents,
@@ -25,11 +25,23 @@ interface ParsedFiles {
 }
 
 export default async (fastify: FastifyInstance) => {
-  // Public: List events
-  fastify.get('/', async (_request, reply) => {
-    const events = await getEvents({ upcoming: true });
-    reply.send(events);
-  });
+  const server = fastify.withTypeProvider<ZodTypeProvider>();
+
+  // Public: List events with pagination and filtering
+  server.get(
+    '/',
+    {
+      schema: {
+        description: 'List published events with pagination, search, and filtering',
+        tags: ['events'],
+        querystring: getEventsQuerySchema,
+      },
+    },
+    async (request, reply) => {
+      const result = await getEvents(request.query);
+      return reply.send(result);
+    }
+  );
 
   // Public: Get featured events (must be before /:id)
   fastify.get('/featured', async (request, reply) => {
@@ -68,7 +80,7 @@ export default async (fastify: FastifyInstance) => {
     }
   );
 
-  // Public: Get event by ID
+  // Public: Get event by ID (published only)
   fastify.get('/:id', async (request, reply) => {
     try {
       const { id } = request.params as { id: string };
@@ -154,8 +166,6 @@ export default async (fastify: FastifyInstance) => {
       }
     }
   );
-
-  const server = fastify.withTypeProvider<ZodTypeProvider>();
 
   // Organizer/Admin only: Postpone event
   server.post(

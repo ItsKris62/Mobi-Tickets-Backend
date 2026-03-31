@@ -1,6 +1,6 @@
 import { prisma } from '../../lib/prisma';
 import { uploadEventPoster, uploadEventTrailer } from '../../lib/cloudinary';
-import { CreateEventInput } from './events.schema';
+import { CreateEventInput, GetEventsQuery } from './events.schema';
 import { MultipartFile } from '@fastify/multipart';
 import { notifyEventAttendees, notifyAdmins } from '../notifications/notification.service';
 import { logAudit } from '../../lib/audit';
@@ -29,58 +29,148 @@ export const createEvent = async (
   });
 };
 
-export const getEvents = async (query: { upcoming?: boolean }) => {
-  return prisma.event.findMany({
-    where: {
-      deletedAt: null,
-      ...(query.upcoming ? { startTime: { gt: new Date() }, isPublished: true } : {}),
+/** Shape returned by GET /events (public listing) */
+function formatPublicEvent(event: any) {
+  const location = (typeof event.location === 'object' && event.location !== null)
+    ? event.location as { venue?: string; address?: string }
+    : {};
+
+  const availableTickets = (event.tickets || []).filter(
+    (t: any) => t.status === 'AVAILABLE' && t.availableQuantity > 0
+  );
+  const prices = availableTickets.map((t: any) => Number(t.price));
+  const totalAvailable = (event.tickets || []).reduce(
+    (sum: number, t: any) => sum + (t.availableQuantity || 0),
+    0
+  );
+
+  return {
+    id: event.id,
+    title: event.title,
+    description: event.description ? event.description.substring(0, 200) : '',
+    posterUrl: event.posterUrl || null,
+    category: event.category || '',
+    venue: location.venue || '',
+    location: location.address || '',
+    county: event.county || '',
+    startTime: event.startTime instanceof Date ? event.startTime.toISOString() : event.startTime,
+    endTime: event.endTime
+      ? (event.endTime instanceof Date ? event.endTime.toISOString() : event.endTime)
+      : null,
+    isFeatured: event.isFeatured ?? false,
+    organizer: {
+      id: event.organizer.id,
+      name: event.organizer.fullName || '',
+      avatarUrl: event.organizer.avatarUrl || null,
     },
-    orderBy: { startTime: 'asc' },
-    include: {
-      organizer: {
-        select: {
-          id: true,
-          fullName: true,
-          email: true,
-        },
-      },
-      tickets: {
-        select: {
-          id: true,
-          category: true,
-          name: true,
-          price: true,
-          totalQuantity: true,
-          availableQuantity: true,
-          status: true,
-        },
-      },
+    ticketSummary: {
+      lowestPrice: prices.length > 0 ? Math.min(...prices) : 0,
+      highestPrice: prices.length > 0 ? Math.max(...prices) : 0,
+      totalAvailable,
+      categories: (event.tickets || []).map((t: any) => ({
+        id: t.id,
+        name: t.name,
+        category: t.category,
+        price: Number(t.price),
+        available: t.availableQuantity,
+      })),
     },
-  });
+    isSoldOut: totalAvailable === 0,
+    createdAt: event.createdAt instanceof Date ? event.createdAt.toISOString() : event.createdAt,
+  };
+}
+
+const ORGANIZER_PUBLIC_SELECT = {
+  id: true,
+  fullName: true,
+  avatarUrl: true,
+  // email intentionally excluded from public endpoints
+} as const;
+
+const TICKET_SELECT = {
+  id: true,
+  category: true,
+  name: true,
+  price: true,
+  totalQuantity: true,
+  availableQuantity: true,
+  status: true,
+} as const;
+
+export const getEvents = async (query: GetEventsQuery) => {
+  const { page, limit, search, category, county, featured, startDate, endDate, sortBy, sortOrder } = query;
+
+  const where: any = {
+    isPublished: true,
+    status: 'PUBLISHED',
+    deletedAt: null,
+    ...(search && {
+      OR: [
+        { title: { contains: search } },
+        { description: { contains: search } },
+      ],
+    }),
+    ...(category && { category }),
+    ...(county && { county }),
+    ...(featured === 'true' && { isFeatured: true }),
+    ...(startDate && { startTime: { gte: new Date(startDate) } }),
+    ...(endDate && { startTime: { lte: new Date(endDate) } }),
+  };
+
+  const [totalItems, events, allCategories, allCounties] = await Promise.all([
+    prisma.event.count({ where }),
+    prisma.event.findMany({
+      where,
+      include: {
+        organizer: { select: ORGANIZER_PUBLIC_SELECT },
+        tickets: { select: TICKET_SELECT },
+      },
+      orderBy: { [sortBy]: sortOrder },
+      skip: (page - 1) * limit,
+      take: limit,
+    }),
+    prisma.event.findMany({
+      where: { isPublished: true, status: 'PUBLISHED', deletedAt: null, category: { not: null } },
+      select: { category: true },
+      distinct: ['category'],
+    }),
+    prisma.event.findMany({
+      where: { isPublished: true, status: 'PUBLISHED', deletedAt: null, county: { not: null } },
+      select: { county: true },
+      distinct: ['county'],
+    }),
+  ]);
+
+  const totalPages = Math.ceil(totalItems / limit);
+
+  return {
+    events: events.map(formatPublicEvent),
+    pagination: {
+      page,
+      limit,
+      totalItems,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPrevPage: page > 1,
+    },
+    filters: {
+      categories: allCategories.map((c: any) => c.category).filter(Boolean),
+      counties: allCounties.map((c: any) => c.county).filter(Boolean),
+    },
+  };
 };
 
 export const getEventById = async (eventId: string) => {
   const event = await prisma.event.findFirst({
-    where: { id: eventId, deletedAt: null },
+    where: {
+      id: eventId,
+      isPublished: true,
+      status: 'PUBLISHED',
+      deletedAt: null,
+    },
     include: {
-      organizer: {
-        select: {
-          id: true,
-          fullName: true,
-          email: true,
-        },
-      },
-      tickets: {
-        select: {
-          id: true,
-          category: true,
-          name: true,
-          price: true,
-          totalQuantity: true,
-          availableQuantity: true,
-          status: true,
-        },
-      },
+      organizer: { select: ORGANIZER_PUBLIC_SELECT },
+      tickets: { select: TICKET_SELECT },
     },
   });
 
@@ -88,7 +178,47 @@ export const getEventById = async (eventId: string) => {
     throw new Error('Event not found');
   }
 
-  return event;
+  const location = (typeof event.location === 'object' && event.location !== null)
+    ? event.location as { venue?: string; address?: string }
+    : {};
+
+  const totalAvailable = event.tickets.reduce(
+    (sum, t) => sum + (t.availableQuantity || 0),
+    0
+  );
+
+  return {
+    id: event.id,
+    title: event.title,
+    description: event.description || '',
+    posterUrl: event.posterUrl || null,
+    category: event.category || '',
+    venue: location.venue || '',
+    location: location.address || '',
+    county: event.county || '',
+    startTime: event.startTime.toISOString(),
+    endTime: event.endTime?.toISOString() || null,
+    isFeatured: event.isFeatured,
+    status: event.status,
+    organizer: {
+      id: event.organizer.id,
+      name: event.organizer.fullName || '',
+      avatarUrl: event.organizer.avatarUrl || null,
+    },
+    tickets: event.tickets.map(t => ({
+      id: t.id,
+      name: t.name,
+      category: t.category,
+      price: Number(t.price),
+      totalQuantity: t.totalQuantity,
+      availableQuantity: t.availableQuantity,
+      available: t.availableQuantity,
+      status: t.status,
+    })),
+    isSoldOut: totalAvailable === 0,
+    createdAt: event.createdAt.toISOString(),
+    updatedAt: event.updatedAt.toISOString(),
+  };
 };
 
 export const updateEvent = async (
@@ -99,7 +229,6 @@ export const updateEvent = async (
   posterFile?: MultipartFile,
   trailerFile?: MultipartFile
 ) => {
-  // Check ownership
   const event = await prisma.event.findUnique({
     where: { id: eventId },
     select: { organizerId: true },
@@ -134,7 +263,6 @@ export const deleteEvent = async (
   userId: string,
   userRole: string
 ) => {
-  // Check ownership
   const event = await prisma.event.findFirst({
     where: { id: eventId, deletedAt: null },
     select: { organizerId: true },
@@ -148,7 +276,6 @@ export const deleteEvent = async (
     throw new Error('Unauthorized: You can only delete your own events');
   }
 
-  // Soft delete
   await prisma.event.update({
     where: { id: eventId },
     data: { deletedAt: new Date() },
@@ -157,7 +284,6 @@ export const deleteEvent = async (
   return { message: 'Event deleted successfully' };
 };
 
-// Postpone event
 export const postponeEvent = async (
   eventId: string,
   userId: string,
@@ -166,7 +292,6 @@ export const postponeEvent = async (
   newEndTime: Date | null,
   reason: string
 ) => {
-  // Check ownership
   const event = await prisma.event.findUnique({
     where: { id: eventId },
     include: {
@@ -184,10 +309,8 @@ export const postponeEvent = async (
     throw new Error('Unauthorized: You can only postpone your own events');
   }
 
-  // Store original time if not already postponed
   const originalStartTime = event.originalStartTime || event.startTime;
 
-  // Update event with new times and status
   const updatedEvent = await prisma.event.update({
     where: { id: eventId },
     data: {
@@ -200,7 +323,6 @@ export const postponeEvent = async (
     },
   });
 
-  // Notify admin about postponement
   await notifyAdmins(
     'EVENT_POSTPONED',
     `Event Postponed: ${event.title}`,
@@ -216,23 +338,14 @@ export const postponeEvent = async (
     }
   );
 
-  // Notify all ticket holders
   const formattedOldDate = event.startTime.toLocaleDateString('en-KE', {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
   });
 
   const formattedNewDate = newStartTime.toLocaleDateString('en-KE', {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
   });
 
   const { notifiedCount } = await notifyEventAttendees(
@@ -247,10 +360,9 @@ export const postponeEvent = async (
       newStartTime: newStartTime.toISOString(),
       reason,
     },
-    true // Send email notifications
+    true
   );
 
-  // Log the action
   await logAudit('EVENT_POSTPONED', 'Event', eventId, userId, {
     oldStartTime: event.startTime.toISOString(),
     newStartTime: newStartTime.toISOString(),
@@ -265,14 +377,12 @@ export const postponeEvent = async (
   };
 };
 
-// Cancel event
 export const cancelEvent = async (
   eventId: string,
   userId: string,
   userRole: string,
   reason: string
 ) => {
-  // Check ownership
   const event = await prisma.event.findUnique({
     where: { id: eventId },
     include: {
@@ -290,7 +400,6 @@ export const cancelEvent = async (
     throw new Error('Unauthorized: You can only cancel your own events');
   }
 
-  // Update event status
   const updatedEvent = await prisma.event.update({
     where: { id: eventId },
     data: {
@@ -299,7 +408,6 @@ export const cancelEvent = async (
     },
   });
 
-  // Notify admin about cancellation
   await notifyAdmins(
     'EVENT_CANCELLED',
     `Event Cancelled: ${event.title}`,
@@ -313,27 +421,20 @@ export const cancelEvent = async (
     }
   );
 
-  // Notify all ticket holders
   const { notifiedCount } = await notifyEventAttendees(
     eventId,
     'EVENT_CANCELLED',
     `Event Cancelled: ${event.title}`,
     `We regret to inform you that "${event.title}" has been cancelled.\n\nReason: ${reason}\n\nRefund processing will begin shortly. You will receive an email with refund details.`,
-    {
-      eventId,
-      eventTitle: event.title,
-      reason,
-    },
+    { eventId, eventTitle: event.title, reason },
     true
   );
 
-  // Log the action
   await logAudit('EVENT_CANCELLED', 'Event', eventId, userId, {
     reason,
     attendeesNotified: notifiedCount,
   });
 
-  // Auto-generate system alert
   await createSystemAlert(
     'event',
     'high',
@@ -349,7 +450,6 @@ export const cancelEvent = async (
   };
 };
 
-// Publish event (with validation)
 export const publishEvent = async (
   eventId: string,
   userId: string,
@@ -368,7 +468,6 @@ export const publishEvent = async (
     throw new Error('Unauthorized: You can only publish your own events');
   }
 
-  // Validation checks
   if (!event.posterUrl) {
     throw new Error('Event poster is required before publishing');
   }
@@ -394,7 +493,6 @@ export const publishEvent = async (
   });
 };
 
-// Get organizer's events
 export const getOrganizerEvents = async (
   organizerId: string,
   options?: {
@@ -432,9 +530,8 @@ export const getOrganizerEvents = async (
   });
 };
 
-// Get featured events
 export const getFeaturedEvents = async (limit = 10) => {
-  return prisma.event.findMany({
+  const events = await prisma.event.findMany({
     where: {
       isFeatured: true,
       status: 'PUBLISHED',
@@ -445,24 +542,14 @@ export const getFeaturedEvents = async (limit = 10) => {
     take: limit,
     orderBy: { featuredAt: 'desc' },
     include: {
-      organizer: {
-        select: { id: true, fullName: true, email: true },
-      },
-      tickets: {
-        select: {
-          id: true,
-          category: true,
-          name: true,
-          price: true,
-          availableQuantity: true,
-          status: true,
-        },
-      },
+      organizer: { select: ORGANIZER_PUBLIC_SELECT },
+      tickets: { select: TICKET_SELECT },
     },
   });
+
+  return events.map(formatPublicEvent);
 };
 
-// Get event attendees (for organizer/admin)
 export const getEventAttendees = async (
   eventId: string,
   userId: string,
@@ -470,7 +557,6 @@ export const getEventAttendees = async (
   page = 1,
   limit = 20
 ) => {
-  // Check ownership (organizer can only see their own event attendees)
   const event = await prisma.event.findUnique({
     where: { id: eventId },
     select: { organizerId: true, title: true },
