@@ -17,6 +17,17 @@ import {
 } from './auth.schema';
 import { FastifyInstance } from 'fastify';
 
+// OWASP-recommended argon2id params — fast enough for <1.5s signup, secure for production
+const ARGON2_PARAMS = {
+  type: argon2.argon2id,
+  memoryCost: 19456, // 19 MB — OWASP minimum recommendation
+  timeCost: 2,
+  parallelism: 1,
+} as const;
+
+// Redis TTL for cached user profiles (seconds)
+const USER_PROFILE_CACHE_TTL = 60;
+
 // Helper to generate JWT
 const generateAccessToken = async (
   fastify: FastifyInstance,
@@ -45,26 +56,20 @@ export const registerUser = async (
     emergencyContact,
   } = data;
 
-  // Check for existing email
-  const existingEmail = await prisma.user.findUnique({ where: { email } });
+  // Parallelize email + phone uniqueness checks
+  const [existingEmail, existingPhone] = await Promise.all([
+    prisma.user.findUnique({ where: { email } }),
+    phoneNumber ? prisma.user.findFirst({ where: { phoneNumber } }) : Promise.resolve(null),
+  ]);
+
   if (existingEmail) {
     throw new Error('Email already registered');
   }
-
-  // Check for existing phone number if provided
-  if (phoneNumber) {
-    const existingPhone = await prisma.user.findFirst({ where: { phoneNumber } });
-    if (existingPhone) {
-      throw new Error('Phone number already registered');
-    }
+  if (existingPhone) {
+    throw new Error('Phone number already registered');
   }
 
-  const passwordHash = await argon2.hash(password, {
-    type: argon2.argon2id,
-    memoryCost: 65536, // 64 MB
-    timeCost: 3,
-    parallelism: 4,
-  });
+  const passwordHash = await argon2.hash(password, ARGON2_PARAMS);
 
   const user = await prisma.user.create({
     data: {
@@ -84,7 +89,7 @@ export const registerUser = async (
   await logAudit('USER_REGISTERED', 'User', user.id, user.id, {
     email,
     role,
-    phoneNumber: phoneNumber ? '***' + phoneNumber.slice(-4) : undefined, // Mask phone for audit
+    phoneNumber: phoneNumber ? '***' + phoneNumber.slice(-4) : undefined,
   });
 
   return {
@@ -105,17 +110,17 @@ export const registerAndLogin = async (
   data: RegisterInput,
   fastify: FastifyInstance
 ): Promise<AuthResponse> => {
-  // First register the user
   const userResponse = await registerUser(data, fastify);
 
-  // Then generate tokens for auto-login
-  const accessToken = await generateAccessToken(fastify, {
-    id: userResponse.id,
-    email: userResponse.email,
-    role: userResponse.role,
-  });
-
-  const refreshToken = await generateRefreshToken(userResponse.id);
+  // Parallelize token generation
+  const [accessToken, refreshToken] = await Promise.all([
+    generateAccessToken(fastify, {
+      id: userResponse.id,
+      email: userResponse.email,
+      role: userResponse.role,
+    }),
+    generateRefreshToken(userResponse.id),
+  ]);
 
   await logAudit('USER_AUTO_LOGIN_AFTER_REGISTER', 'User', userResponse.id, userResponse.id, {
     email: userResponse.email,
@@ -159,13 +164,19 @@ export const loginUser = async (
     throw new Error('Invalid credentials');
   }
 
-  const accessToken = await generateAccessToken(fastify, {
-    id: user.id,
-    email: user.email,
-    role: user.role,
-  });
+  // Transparent rehash: if stored hash used old (expensive) params, upgrade silently on login
+  if (argon2.needsRehash(user.passwordHash, ARGON2_PARAMS)) {
+    const newHash = await argon2.hash(password, ARGON2_PARAMS);
+    await prisma.user.update({ where: { id: user.id }, data: { passwordHash: newHash } });
+    // Invalidate cached profile so next /validate call gets fresh data
+    await redis.del(`user:profile:${user.id}`);
+  }
 
-  const refreshToken = await generateRefreshToken(user.id);
+  // Parallelize access token + refresh token generation
+  const [accessToken, refreshToken] = await Promise.all([
+    generateAccessToken(fastify, { id: user.id, email: user.email, role: user.role }),
+    generateRefreshToken(user.id),
+  ]);
 
   await logAudit('USER_LOGIN_SUCCESS', 'User', user.id, user.id, { email });
 
@@ -294,7 +305,7 @@ export const walletLogin = async (
 
   // Find or create user (using address as identifier)
   const walletEmail = `${address.toLowerCase()}@wallet`;
-  
+
   let user = await prisma.user.findFirst({
     where: { email: walletEmail },
   });
@@ -355,8 +366,23 @@ export const requestPasswordReset = async (data: ResetPasswordInput): Promise<{ 
   return { message: 'If an account with that email exists, a reset link has been sent.' };
 };
 
-// Validate JWT token and return fresh user data
+// Validate JWT token — Redis-cached (60s TTL) to avoid DB hit on every page load
 export const validateToken = async (userId: string) => {
+  const cacheKey = `user:profile:${userId}`;
+
+  // 1. Try Redis cache first
+  try {
+    const cached = await redis.get<string>(cacheKey);
+    if (cached) {
+      const parsed = typeof cached === 'string' ? JSON.parse(cached) : cached;
+      return { valid: true, user: parsed };
+    }
+  } catch (cacheErr) {
+    // Cache miss or error — fall through to DB
+    console.warn('[validateToken] Redis cache miss or error:', cacheErr);
+  }
+
+  // 2. DB lookup on cache miss
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: {
@@ -374,18 +400,34 @@ export const validateToken = async (userId: string) => {
     throw new Error('User not found');
   }
 
-  return {
-    valid: true,
-    user: {
-      id: user.id,
-      email: user.email,
-      role: user.role,
-      fullName: user.fullName ?? undefined,
-      avatarUrl: user.avatarUrl ?? undefined,
-      isVerified: user.isVerified,
-      isBanned: user.isBanned,
-    },
+  const userPayload = {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    fullName: user.fullName ?? undefined,
+    avatarUrl: user.avatarUrl ?? undefined,
+    isVerified: user.isVerified,
+    isBanned: user.isBanned,
   };
+
+  // 3. Store in Redis cache with TTL
+  try {
+    await redis.set(cacheKey, JSON.stringify(userPayload), { ex: USER_PROFILE_CACHE_TTL });
+  } catch (cacheErr) {
+    // Non-fatal — continue without caching
+    console.warn('[validateToken] Failed to cache user profile:', cacheErr);
+  }
+
+  return { valid: true, user: userPayload };
+};
+
+// Invalidate user profile cache (call after role change, ban, profile update)
+export const invalidateUserProfileCache = async (userId: string): Promise<void> => {
+  try {
+    await redis.del(`user:profile:${userId}`);
+  } catch (err) {
+    console.warn('[invalidateUserProfileCache] Failed to invalidate cache:', err);
+  }
 };
 
 // Logout user by revoking refresh token
@@ -402,6 +444,9 @@ export const logoutUser = async (data: LogoutInput, userId: string): Promise<{ m
       data: { revoked: true },
     });
   }
+
+  // Invalidate profile cache on logout
+  await invalidateUserProfileCache(userId);
 
   await logAudit('USER_LOGOUT', 'User', userId, userId);
 

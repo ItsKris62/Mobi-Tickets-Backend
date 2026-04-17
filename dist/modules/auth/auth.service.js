@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.walletLogin = exports.refreshAccessToken = exports.generateRefreshToken = exports.loginUser = exports.registerUser = void 0;
+exports.logoutUser = exports.invalidateUserProfileCache = exports.validateToken = exports.requestPasswordReset = exports.walletLogin = exports.refreshAccessToken = exports.generateRefreshToken = exports.loginUser = exports.registerAndLogin = exports.registerUser = void 0;
 const tslib_1 = require("tslib");
 const argon2 = tslib_1.__importStar(require("argon2"));
 const crypto_1 = require("crypto");
@@ -9,55 +9,112 @@ const redis_1 = require("../../lib/redis");
 const env_1 = require("../../config/env");
 const audit_1 = require("../../lib/audit");
 const ethers_1 = require("ethers");
+const ARGON2_PARAMS = {
+    type: argon2.argon2id,
+    memoryCost: 19456,
+    timeCost: 2,
+    parallelism: 1,
+};
+const USER_PROFILE_CACHE_TTL = 60;
 const generateAccessToken = async (fastify, payload) => {
     return fastify.jwt.sign(payload, {
         expiresIn: env_1.envConfig.JWT_ACCESS_EXPIRATION || '15m',
     });
 };
-const registerUser = async (data, fastify) => {
-    const { email, password, fullName } = data;
-    const existing = await prisma_1.prisma.user.findUnique({ where: { email } });
-    if (existing) {
+const registerUser = async (data, _fastify) => {
+    const { email, password, fullName, role = 'ATTENDEE', phoneNumber, dateOfBirth, idNumber, county, city, emergencyContact, } = data;
+    const [existingEmail, existingPhone] = await Promise.all([
+        prisma_1.prisma.user.findUnique({ where: { email } }),
+        phoneNumber ? prisma_1.prisma.user.findFirst({ where: { phoneNumber } }) : Promise.resolve(null),
+    ]);
+    if (existingEmail) {
         throw new Error('Email already registered');
     }
-    const passwordHash = await argon2.hash(password, {
-        type: argon2.argon2id,
-        memoryCost: 65536,
-        timeCost: 3,
-        parallelism: 4,
-    });
+    if (existingPhone) {
+        throw new Error('Phone number already registered');
+    }
+    const passwordHash = await argon2.hash(password, ARGON2_PARAMS);
     const user = await prisma_1.prisma.user.create({
         data: {
             email,
             passwordHash,
             fullName,
-            role: 'ATTENDEE',
+            role,
+            phoneNumber,
+            dateOfBirth,
+            idNumber,
+            county,
+            city,
+            emergencyContact: emergencyContact ? emergencyContact : undefined,
         },
     });
-    await (0, audit_1.logAudit)('USER_REGISTERED', 'User', user.id, user.id, { email });
+    await (0, audit_1.logAudit)('USER_REGISTERED', 'User', user.id, user.id, {
+        email,
+        role,
+        phoneNumber: phoneNumber ? '***' + phoneNumber.slice(-4) : undefined,
+    });
     return {
         id: user.id,
         email: user.email,
         role: user.role,
+        fullName: user.fullName ?? undefined,
+        phoneNumber: user.phoneNumber ?? undefined,
+        dateOfBirth: user.dateOfBirth?.toISOString(),
+        county: user.county ?? undefined,
+        city: user.city ?? undefined,
+        isVerified: user.isVerified,
     };
 };
 exports.registerUser = registerUser;
+const registerAndLogin = async (data, fastify) => {
+    const userResponse = await (0, exports.registerUser)(data, fastify);
+    const [accessToken, refreshToken] = await Promise.all([
+        generateAccessToken(fastify, {
+            id: userResponse.id,
+            email: userResponse.email,
+            role: userResponse.role,
+        }),
+        (0, exports.generateRefreshToken)(userResponse.id),
+    ]);
+    await (0, audit_1.logAudit)('USER_AUTO_LOGIN_AFTER_REGISTER', 'User', userResponse.id, userResponse.id, {
+        email: userResponse.email,
+    });
+    return {
+        accessToken,
+        refreshToken,
+        user: {
+            id: userResponse.id,
+            email: userResponse.email,
+            role: userResponse.role,
+            fullName: userResponse.fullName,
+            phoneNumber: userResponse.phoneNumber,
+            isVerified: userResponse.isVerified,
+        },
+    };
+};
+exports.registerAndLogin = registerAndLogin;
 const loginUser = async (data, fastify) => {
     const { email, password } = data;
     const user = await prisma_1.prisma.user.findUnique({ where: { email } });
     if (!user || !user.passwordHash) {
         throw new Error('Invalid credentials');
     }
+    if (!user.isActive) {
+        throw new Error('Account is deactivated. Please contact support.');
+    }
     const isValidPassword = await argon2.verify(user.passwordHash, password);
     if (!isValidPassword) {
         throw new Error('Invalid credentials');
     }
-    const accessToken = await generateAccessToken(fastify, {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-    });
-    const refreshToken = await (0, exports.generateRefreshToken)(user.id);
+    if (argon2.needsRehash(user.passwordHash, ARGON2_PARAMS)) {
+        const newHash = await argon2.hash(password, ARGON2_PARAMS);
+        await prisma_1.prisma.user.update({ where: { id: user.id }, data: { passwordHash: newHash } });
+        await redis_1.redis.del(`user:profile:${user.id}`);
+    }
+    const [accessToken, refreshToken] = await Promise.all([
+        generateAccessToken(fastify, { id: user.id, email: user.email, role: user.role }),
+        (0, exports.generateRefreshToken)(user.id),
+    ]);
     await (0, audit_1.logAudit)('USER_LOGIN_SUCCESS', 'User', user.id, user.id, { email });
     return {
         accessToken,
@@ -66,6 +123,10 @@ const loginUser = async (data, fastify) => {
             id: user.id,
             email: user.email,
             role: user.role,
+            fullName: user.fullName ?? undefined,
+            avatarUrl: user.avatarUrl ?? undefined,
+            phoneNumber: user.phoneNumber ?? undefined,
+            isVerified: user.isVerified,
         },
     };
 };
@@ -129,7 +190,7 @@ const walletLogin = async (data, fastify) => {
     }
     const nonceKey = `wallet_nonce:${nonce}`;
     const nonceExists = await redis_1.redis.exists(nonceKey);
-    if (nonceExists) {
+    if (nonceExists > 0) {
         throw new Error('Nonce already used. Potential replay attack detected.');
     }
     const expectedMessagePattern = `Sign this message to authenticate with MobiTickets.\n\nAddress: ${address.toLowerCase()}\nNonce: ${nonce}\nTimestamp: ${timestamp}`;
@@ -146,7 +207,7 @@ const walletLogin = async (data, fastify) => {
         const errorMessage = err instanceof Error ? err.message : 'Unknown error';
         throw new Error(`Wallet verification failed: ${errorMessage}`);
     }
-    await redis_1.redis.setex(nonceKey, 600, '1');
+    await redis_1.redis.set(nonceKey, '1', { ex: 600 });
     const walletEmail = `${address.toLowerCase()}@wallet`;
     let user = await prisma_1.prisma.user.findFirst({
         where: { email: walletEmail },
@@ -180,4 +241,86 @@ const walletLogin = async (data, fastify) => {
     };
 };
 exports.walletLogin = walletLogin;
+const requestPasswordReset = async (data) => {
+    const { email } = data;
+    const user = await prisma_1.prisma.user.findUnique({ where: { email } });
+    if (user) {
+        const resetToken = (0, crypto_1.randomBytes)(32).toString('hex');
+        const redisKey = `pwd_reset:${resetToken}`;
+        await redis_1.redis.set(redisKey, user.id, { ex: 3600 });
+        await (0, audit_1.logAudit)('PASSWORD_RESET_REQUESTED', 'User', user.id, user.id, { email });
+    }
+    return { message: 'If an account with that email exists, a reset link has been sent.' };
+};
+exports.requestPasswordReset = requestPasswordReset;
+const validateToken = async (userId) => {
+    const cacheKey = `user:profile:${userId}`;
+    try {
+        const cached = await redis_1.redis.get(cacheKey);
+        if (cached) {
+            const parsed = typeof cached === 'string' ? JSON.parse(cached) : cached;
+            return { valid: true, user: parsed };
+        }
+    }
+    catch (cacheErr) {
+        console.warn('[validateToken] Redis cache miss or error:', cacheErr);
+    }
+    const user = await prisma_1.prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+            id: true,
+            email: true,
+            role: true,
+            fullName: true,
+            avatarUrl: true,
+            isVerified: true,
+            isBanned: true,
+        },
+    });
+    if (!user) {
+        throw new Error('User not found');
+    }
+    const userPayload = {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        fullName: user.fullName ?? undefined,
+        avatarUrl: user.avatarUrl ?? undefined,
+        isVerified: user.isVerified,
+        isBanned: user.isBanned,
+    };
+    try {
+        await redis_1.redis.set(cacheKey, JSON.stringify(userPayload), { ex: USER_PROFILE_CACHE_TTL });
+    }
+    catch (cacheErr) {
+        console.warn('[validateToken] Failed to cache user profile:', cacheErr);
+    }
+    return { valid: true, user: userPayload };
+};
+exports.validateToken = validateToken;
+const invalidateUserProfileCache = async (userId) => {
+    try {
+        await redis_1.redis.del(`user:profile:${userId}`);
+    }
+    catch (err) {
+        console.warn('[invalidateUserProfileCache] Failed to invalidate cache:', err);
+    }
+};
+exports.invalidateUserProfileCache = invalidateUserProfileCache;
+const logoutUser = async (data, userId) => {
+    const { refreshToken } = data;
+    const stored = await prisma_1.prisma.refreshToken.findUnique({
+        where: { token: refreshToken },
+    });
+    if (stored && stored.userId === userId) {
+        await prisma_1.prisma.refreshToken.update({
+            where: { token: refreshToken },
+            data: { revoked: true },
+        });
+    }
+    await (0, exports.invalidateUserProfileCache)(userId);
+    await (0, audit_1.logAudit)('USER_LOGOUT', 'User', userId, userId);
+    return { message: 'Logged out successfully' };
+};
+exports.logoutUser = logoutUser;
 //# sourceMappingURL=auth.service.js.map

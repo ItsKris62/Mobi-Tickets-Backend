@@ -1,3 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-export declare const prisma: PrismaClient<import(".prisma/client").Prisma.PrismaClientOptions, never, import("@prisma/client/runtime/client").DefaultArgs>;
+export declare function getPrismaPromise(): Promise<PrismaClient>;
+export declare let prisma: PrismaClient;
+export declare function initializePrisma(): Promise<PrismaClient>;
 //# sourceMappingURL=prisma.d.ts.map

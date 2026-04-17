@@ -21,7 +21,6 @@ const authPlugin = async (fastify) => {
             request.user = decoded;
         }
         catch (err) {
-            const errorMessage = err instanceof Error ? err.message : 'Authentication failed';
             fastify.log.error({ err }, 'JWT verification failed');
             reply.code(401).send({ error: 'Invalid or expired token' });
             return;

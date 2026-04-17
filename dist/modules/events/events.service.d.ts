@@ -1,91 +1,229 @@
-import { CreateEventInput } from './events.schema';
+import { CreateEventInput, GetEventsQuery } from './events.schema';
 import { MultipartFile } from '@fastify/multipart';
 export declare const createEvent: (data: CreateEventInput, organizerId: string, posterFile?: MultipartFile, trailerFile?: MultipartFile) => Promise<{
     id: string;
+    county: string | null;
     createdAt: Date;
     updatedAt: Date;
     title: string;
     description: string | null;
     startTime: Date;
     endTime: Date | null;
+    originalStartTime: Date | null;
     location: import("@prisma/client/runtime/client").JsonValue | null;
     posterUrl: string | null;
     videoUrl: string | null;
     organizerId: string;
+    status: import("@prisma/client").$Enums.EventStatus;
     isPublished: boolean;
+    ageLimit: number | null;
+    maxCapacity: number | null;
+    postponementReason: string | null;
+    postponedAt: Date | null;
+    category: import("@prisma/client").$Enums.EventCategory;
+    tags: import("@prisma/client/runtime/client").JsonValue | null;
+    deletedAt: Date | null;
+    publishedAt: Date | null;
+    isFeatured: boolean;
+    featuredAt: Date | null;
 }>;
-export declare const getEvents: (query: {
-    upcoming?: boolean;
-}) => Promise<({
-    organizer: {
-        id: string;
-        email: string;
-        fullName: string | null;
-    };
-    tickets: {
-        type: string;
-        id: string;
-        status: import(".prisma/client").$Enums.TicketStatus;
-        price: number;
-        availableQuantity: number;
-    }[];
-} & {
+export declare const getEvents: (query: GetEventsQuery) => Promise<any>;
+export declare const getEventById: (eventId: string) => Promise<any>;
+export declare const updateEvent: (eventId: string, userId: string, userRole: string, data: Partial<CreateEventInput>, posterFile?: MultipartFile, trailerFile?: MultipartFile) => Promise<{
     id: string;
+    county: string | null;
     createdAt: Date;
     updatedAt: Date;
     title: string;
     description: string | null;
     startTime: Date;
     endTime: Date | null;
+    originalStartTime: Date | null;
     location: import("@prisma/client/runtime/client").JsonValue | null;
     posterUrl: string | null;
     videoUrl: string | null;
     organizerId: string;
+    status: import("@prisma/client").$Enums.EventStatus;
     isPublished: boolean;
-})[]>;
-export declare const getEventById: (eventId: string) => Promise<{
-    organizer: {
+    ageLimit: number | null;
+    maxCapacity: number | null;
+    postponementReason: string | null;
+    postponedAt: Date | null;
+    category: import("@prisma/client").$Enums.EventCategory;
+    tags: import("@prisma/client/runtime/client").JsonValue | null;
+    deletedAt: Date | null;
+    publishedAt: Date | null;
+    isFeatured: boolean;
+    featuredAt: Date | null;
+}>;
+export declare const deleteEvent: (eventId: string, userId: string, userRole: string) => Promise<{
+    message: string;
+}>;
+export declare const postponeEvent: (eventId: string, userId: string, userRole: string, newStartTime: Date, newEndTime: Date | null, reason: string) => Promise<{
+    event: {
         id: string;
-        email: string;
-        fullName: string | null;
+        county: string | null;
+        createdAt: Date;
+        updatedAt: Date;
+        title: string;
+        description: string | null;
+        startTime: Date;
+        endTime: Date | null;
+        originalStartTime: Date | null;
+        location: import("@prisma/client/runtime/client").JsonValue | null;
+        posterUrl: string | null;
+        videoUrl: string | null;
+        organizerId: string;
+        status: import("@prisma/client").$Enums.EventStatus;
+        isPublished: boolean;
+        ageLimit: number | null;
+        maxCapacity: number | null;
+        postponementReason: string | null;
+        postponedAt: Date | null;
+        category: import("@prisma/client").$Enums.EventCategory;
+        tags: import("@prisma/client/runtime/client").JsonValue | null;
+        deletedAt: Date | null;
+        publishedAt: Date | null;
+        isFeatured: boolean;
+        featuredAt: Date | null;
     };
-    tickets: {
-        type: string;
+    attendeesNotified: number;
+    message: string;
+}>;
+export declare const cancelEvent: (eventId: string, userId: string, userRole: string, reason: string) => Promise<{
+    event: {
         id: string;
-        status: import(".prisma/client").$Enums.TicketStatus;
+        county: string | null;
+        createdAt: Date;
+        updatedAt: Date;
+        title: string;
+        description: string | null;
+        startTime: Date;
+        endTime: Date | null;
+        originalStartTime: Date | null;
+        location: import("@prisma/client/runtime/client").JsonValue | null;
+        posterUrl: string | null;
+        videoUrl: string | null;
+        organizerId: string;
+        status: import("@prisma/client").$Enums.EventStatus;
+        isPublished: boolean;
+        ageLimit: number | null;
+        maxCapacity: number | null;
+        postponementReason: string | null;
+        postponedAt: Date | null;
+        category: import("@prisma/client").$Enums.EventCategory;
+        tags: import("@prisma/client/runtime/client").JsonValue | null;
+        deletedAt: Date | null;
+        publishedAt: Date | null;
+        isFeatured: boolean;
+        featuredAt: Date | null;
+    };
+    attendeesNotified: number;
+    message: string;
+}>;
+export declare const publishEvent: (eventId: string, userId: string, userRole: string) => Promise<{
+    id: string;
+    county: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+    title: string;
+    description: string | null;
+    startTime: Date;
+    endTime: Date | null;
+    originalStartTime: Date | null;
+    location: import("@prisma/client/runtime/client").JsonValue | null;
+    posterUrl: string | null;
+    videoUrl: string | null;
+    organizerId: string;
+    status: import("@prisma/client").$Enums.EventStatus;
+    isPublished: boolean;
+    ageLimit: number | null;
+    maxCapacity: number | null;
+    postponementReason: string | null;
+    postponedAt: Date | null;
+    category: import("@prisma/client").$Enums.EventCategory;
+    tags: import("@prisma/client/runtime/client").JsonValue | null;
+    deletedAt: Date | null;
+    publishedAt: Date | null;
+    isFeatured: boolean;
+    featuredAt: Date | null;
+}>;
+export declare const getOrganizerEvents: (organizerId: string, options?: {
+    status?: string;
+    limit?: number;
+    offset?: number;
+}) => Promise<({
+    tickets: {
+        name: string;
+        id: string;
+        category: import("@prisma/client").$Enums.TicketCategory;
         price: number;
         totalQuantity: number;
         availableQuantity: number;
     }[];
+    _count: {
+        orders: number;
+    };
 } & {
     id: string;
+    county: string | null;
     createdAt: Date;
     updatedAt: Date;
     title: string;
     description: string | null;
     startTime: Date;
     endTime: Date | null;
+    originalStartTime: Date | null;
     location: import("@prisma/client/runtime/client").JsonValue | null;
     posterUrl: string | null;
     videoUrl: string | null;
     organizerId: string;
+    status: import("@prisma/client").$Enums.EventStatus;
     isPublished: boolean;
-}>;
-export declare const updateEvent: (eventId: string, userId: string, userRole: string, data: Partial<CreateEventInput>, posterFile?: MultipartFile, trailerFile?: MultipartFile) => Promise<{
-    id: string;
-    createdAt: Date;
-    updatedAt: Date;
-    title: string;
-    description: string | null;
-    startTime: Date;
-    endTime: Date | null;
-    location: import("@prisma/client/runtime/client").JsonValue | null;
-    posterUrl: string | null;
-    videoUrl: string | null;
-    organizerId: string;
-    isPublished: boolean;
-}>;
-export declare const deleteEvent: (eventId: string, userId: string, userRole: string) => Promise<{
-    message: string;
+    ageLimit: number | null;
+    maxCapacity: number | null;
+    postponementReason: string | null;
+    postponedAt: Date | null;
+    category: import("@prisma/client").$Enums.EventCategory;
+    tags: import("@prisma/client/runtime/client").JsonValue | null;
+    deletedAt: Date | null;
+    publishedAt: Date | null;
+    isFeatured: boolean;
+    featuredAt: Date | null;
+})[]>;
+export declare const getFeaturedEvents: (limit?: number) => Promise<any>;
+export declare const getEventAttendees: (eventId: string, userId: string, userRole: string, page?: number, limit?: number) => Promise<{
+    attendees: ({
+        user: {
+            id: string;
+            email: string;
+            fullName: string | null;
+            avatarUrl: string | null;
+            phoneNumber: string | null;
+        };
+        ticket: {
+            name: string;
+            id: string;
+            category: import("@prisma/client").$Enums.TicketCategory;
+            price: number;
+        };
+    } & {
+        id: string;
+        status: string;
+        userId: string;
+        eventId: string;
+        ticketNumber: string;
+        orderId: string;
+        ticketId: string;
+        purchasedAt: Date;
+        qrCodeData: string;
+        checkedInAt: Date | null;
+    })[];
+    pagination: {
+        page: number;
+        limit: number;
+        total: number;
+        totalPages: number;
+    };
 }>;
 //# sourceMappingURL=events.service.d.ts.map

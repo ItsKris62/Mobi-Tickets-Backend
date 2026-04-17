@@ -1,9 +1,18 @@
 // Ticket business logic – atomic purchases with Prisma transactions + QR generation
 import { prisma } from '../../lib/prisma';
-import * as QRCode from 'qrcode';
 import { logAudit } from '../../lib/audit';
-import { sendTicketConfirmationEmail } from '../../lib/queue';
 import { createNotification } from '../notifications/notification.service';
+import crypto from 'crypto';
+import { generateQRCodeData, verifyQRCodeData } from '../../utils/qr-code';
+import { computeEventAnalytics } from '../../utils/analytics';
+import { invalidateOrganizerAnalyticsCache } from './analytics.service';
+
+/** Generates a human-readable ticket number: MBT-YYYYMMDD-XXXX */
+function generateTicketNumber(eventDate: Date): string {
+  const dateStr = new Date(eventDate).toISOString().slice(0, 10).replace(/-/g, '');
+  const random = crypto.randomBytes(3).toString('hex').toUpperCase().substring(0, 4);
+  return `MBT-${dateStr}-${random}`;
+}
 
 // Purchase tickets (transaction-safe to prevent oversell)
 export const purchaseTickets = async (
@@ -11,91 +20,142 @@ export const purchaseTickets = async (
   ticketId: string,
   quantity: number
 ) => {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return prisma.$transaction(async (tx: any) => {
-    // Lock & check availability
-    const ticket = await tx.ticket.findUnique({
-      where: { id: ticketId },
-      select: { availableQuantity: true, price: true, eventId: true },
-    });
+  let attempts = 0;
+  const maxAttempts = 3;
 
-    if (!ticket || ticket.availableQuantity < quantity) {
-      throw new Error('Insufficient tickets available');
-    }
-
-    // Decrement atomically
-    await tx.ticket.update({
-      where: { id: ticketId },
-      data: { availableQuantity: { decrement: quantity } },
-    });
-
-    // Create order
-    const totalAmount = ticket.price * quantity;
-    const order = await tx.order.create({
-      data: {
-        userId,
-        eventId: ticket.eventId,
-        totalAmount,
-        status: 'PENDING',
-      },
-    });
-
-    // Link order item
-    await tx.orderItem.create({
-      data: {
-        orderId: order.id,
-        ticketId,
-        quantity,
-        priceAtTime: ticket.price,
-      },
-    });
-
-    // Generate QR
-    const qrCode = await generateTicketQR(ticketId, order.id);
-
-    // Get user and event info for confirmation
-    const user = await tx.user.findUnique({
-      where: { id: userId },
-      select: { email: true, fullName: true },
-    });
-
-    const event = await tx.event.findUnique({
-      where: { id: ticket.eventId },
-      select: { title: true },
-    });
-
-    // Queue email confirmation via QStash
-    if (user?.email && event) {
-      try {
-        await sendTicketConfirmationEmail(
-          user.email,
-          order.id,
-          event.title,
-          quantity
-        );
-      } catch (err) {
-        // Non-critical: don't fail the purchase if email queueing fails
-      }
-    }
-
-    // Create in-app notification
+  while (attempts < maxAttempts) {
     try {
-      await createNotification({
-        userId,
-        eventId: ticket.eventId,
-        type: 'TICKET_PURCHASE',
-        title: '🎫 Ticket Purchase Confirmed',
-        message: `You purchased ${quantity} ticket(s) for "${event?.title || 'an event'}". Order ID: ${order.id}`,
-        data: { orderId: order.id, ticketId, quantity },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return await prisma.$transaction(async (tx: any) => {
+        // Lock & check availability
+        const ticket = await tx.ticket.findUnique({
+          where: { id: ticketId },
+          select: { 
+            availableQuantity: true, 
+            price: true,
+            name: true,
+            eventId: true,
+            event: { select: { title: true, startTime: true } }
+          },
+        });
+
+        if (!ticket || ticket.availableQuantity < quantity) {
+          throw new Error('Insufficient tickets available');
+        }
+
+        // Decrement atomically
+        await tx.ticket.update({
+          where: { id: ticketId },
+          data: { availableQuantity: { decrement: quantity } },
+        });
+
+        // Create order
+        const totalAmount = ticket.price * quantity;
+        const order = await tx.order.create({
+          data: {
+            userId,
+            eventId: ticket.eventId,
+            totalAmount,
+            status: 'PAID', // Instantly confirmed for "pay-at-venue" logic
+          },
+        });
+
+        // Link order item
+        await tx.orderItem.create({
+          data: {
+            orderId: order.id,
+            ticketId,
+            quantity,
+            priceAtTime: ticket.price,
+          },
+        });
+
+        // Create individual TicketPurchases with placeholders
+        const createdPurchases = [];
+        for (let i = 0; i < quantity; i++) {
+          const purchase = await tx.ticketPurchase.create({
+            data: {
+              userId,
+              orderId: order.id,
+              ticketId,
+              eventId: ticket.eventId,
+              status: 'ACTIVE',
+              ticketNumber: generateTicketNumber(ticket.event.startTime),
+              qrCodeData: crypto.randomUUID(), // Temporary unique placeholder
+            }
+          });
+          createdPurchases.push(purchase);
+        }
+
+        // Now update with real, signed QR codes
+        const finalPurchases = [];
+        for (const purchase of createdPurchases) {
+          const qrPayload = {
+            ticketId: purchase.id,
+            ticketNumber: purchase.ticketNumber,
+            eventId: purchase.eventId,
+            userId: purchase.userId,
+            ticketType: ticket.name,
+            timestamp: Date.now()
+          };
+          const qrCodeData = generateQRCodeData(qrPayload);
+          const updatedPurchase = await tx.ticketPurchase.update({
+            where: { id: purchase.id },
+            data: { qrCodeData }
+          });
+          finalPurchases.push(updatedPurchase);
+        }
+
+        // Get user and event info for confirmation
+        const user = await tx.user.findUnique({
+          where: { id: userId },
+          select: { email: true, fullName: true },
+        });
+
+        // Create in-app notification
+        try {
+          await createNotification({
+            userId,
+            eventId: ticket.eventId,
+            type: 'TICKET_PURCHASE',
+            title: '🎫 Ticket Purchase Confirmed',
+            message: `You purchased ${quantity} ticket(s) for "${ticket.event.title}". Order ID: ${order.id}`,
+            data: { orderId: order.id, ticketId, quantity },
+          });
+        } catch {
+          // Non-critical
+        }
+
+        await logAudit('TICKET_PURCHASED', 'Order', order.id, userId, { ticketId, quantity });
+
+        // Return the first QR code for immediate display on frontend success screen
+        return { order, qrCode: finalPurchases[0]?.qrCodeData };
       });
-    } catch {
-      // Non-critical
+    } catch (error: any) {
+      // P2002 is Prisma's unique constraint violation error code
+      if (error.code === 'P2002' && (error.meta?.target?.includes('ticketNumber') || error.meta?.target === 'ticketNumber')) {
+        attempts++;
+        console.warn(`[purchaseTickets] Ticket number collision detected. Retrying... (Attempt ${attempts} of ${maxAttempts})`);
+        if (attempts >= maxAttempts) throw new Error('High booking volume. Please try again later.');
+        continue; // Retry the entire transaction on ticketNumber collision
+      }
+      throw error; // Rethrow other errors immediately
     }
+  }
 
-    await logAudit('TICKET_PURCHASED', 'Order', order.id, userId, { ticketId, quantity });
-
-    return { order, qrCode };
-  });
+  // After a successful purchase, trigger analytics update (outside the retry loop)
+  try {
+    const ticketInfo = await prisma.ticket.findUnique({ 
+      where: { id: ticketId }, 
+      select: { eventId: true, event: { select: { organizerId: true } } } 
+    });
+    if (ticketInfo) {
+      await computeEventAnalytics(ticketInfo.eventId);
+      await invalidateOrganizerAnalyticsCache(ticketInfo.event.organizerId);
+    }
+  } catch (analyticsError) {
+    console.error(`[Analytics] Failed to update analytics for event after purchase:`, analyticsError);
+  }
 };
 
 // Get user's tickets
@@ -160,28 +220,6 @@ export const getTicketQR = async (orderId: string, userId: string) => {
   const qrCode = await generateTicketQR(orderItems[0]!.ticketId, orderId);
 
   return { qrCode, orderId };
-};
-
-// Generate secure QR code as data URL
-export const generateTicketQR = async (ticketId: string, orderId: string): Promise<string> => {
-  const payload = {
-    ticketId,
-    orderId,
-    timestamp: new Date().toISOString(),
-    // Add nonce or signature for anti-replay
-  };
-
-  const qrData = JSON.stringify(payload);
-  const qrUrl = await QRCode.toDataURL(qrData, {
-    errorCorrectionLevel: 'H',
-    margin: 2,
-    scale: 10,
-    color: { dark: '#000000', light: '#ffffff' },
-  });
-
-  await logAudit('QR_GENERATED', 'Ticket', ticketId, null, { orderId });
-
-  return qrUrl; // Frontend can render as <img src={qrUrl} />
 };
 
 // Request a refund for an order
@@ -292,76 +330,79 @@ export const transferTicket = async (
 
 // Validate a ticket QR code (for event entry)
 export const validateTicket = async (qrData: string) => {
-  let parsed: { ticketId: string; orderId: string; timestamp: string };
+  const payload = verifyQRCodeData(qrData);
 
-  try {
-    parsed = JSON.parse(qrData);
-  } catch {
-    throw new Error('Invalid QR data format');
+  if (!payload) {
+    return { valid: false, message: 'Invalid or tampered QR code.' };
   }
 
-  if (!parsed.ticketId || !parsed.orderId) {
-    throw new Error('QR data missing required fields');
-  }
+  const { ticketId, eventId, ticketType } = payload;
 
-  // Find the order and verify
-  const order = await prisma.order.findUnique({
-    where: { id: parsed.orderId },
+  // Find the ticket purchase record
+  const ticketPurchase = await prisma.ticketPurchase.findUnique({
+    where: { id: ticketId },
     include: {
-      event: {
-        select: { id: true, title: true, startTime: true, location: true },
-      },
-      items: {
-        where: { ticketId: parsed.ticketId },
-        include: {
-          ticket: {
-            select: { id: true, name: true, category: true },
-          },
-        },
-      },
-      user: {
-        select: { id: true, fullName: true, email: true },
-      },
-    },
+      user: { select: { fullName: true } },
+      event: { select: { title: true, organizerId: true } },
+    }
   });
 
-  if (!order) {
-    throw new Error('Order not found – invalid QR code');
+  if (!ticketPurchase) {
+    return { valid: false, message: 'Ticket not found. Invalid QR code.' };
   }
 
-  if (order.status !== 'PAID') {
-    throw new Error(`Ticket invalid – order status is ${order.status}`);
+  // Security check: Does the ticket belong to the event it's being scanned for?
+  if (ticketPurchase.eventId !== eventId) {
+    return { valid: false, message: 'Ticket is for a different event.' };
   }
 
-  // Check if ticket was already used
-  const ticketPurchase = await prisma.ticketPurchase.findFirst({
-    where: {
-      orderId: parsed.orderId,
-      ticketId: parsed.ticketId,
-    },
+  // Check status
+  if (ticketPurchase.status === 'USED') {
+    return {
+      valid: false,
+      message: `Ticket already used at ${new Date(ticketPurchase.checkedInAt!).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' })}`,
+      ticket: {
+        ticketNumber: ticketPurchase.ticketNumber,
+        attendeeName: ticketPurchase.user.fullName,
+        ticketType,
+        eventTitle: ticketPurchase.event.title,
+        status: ticketPurchase.status,
+        checkedInAt: ticketPurchase.checkedInAt,
+      }
+    };
+  }
+
+  if (ticketPurchase.status !== 'ACTIVE') {
+    return { valid: false, message: `Ticket is not active. Status: ${ticketPurchase.status}` };
+  }
+
+  // All checks passed. Mark as USED.
+  const now = new Date();
+  const updatedTicket = await prisma.ticketPurchase.update({
+    where: { id: ticketId },
+    data: { status: 'USED', checkedInAt: now },
   });
 
-  if (ticketPurchase && ticketPurchase.status === 'USED') {
-    throw new Error('Ticket already used');
-  }
+  await logAudit('TICKET_VALIDATED', 'TicketPurchase', ticketId, null, { eventId });
 
-  // Mark ticket as used
-  if (ticketPurchase) {
-    await prisma.ticketPurchase.update({
-      where: { id: ticketPurchase.id },
-      data: { status: 'USED' },
-    });
+  // Trigger analytics update
+  try {
+    await computeEventAnalytics(eventId);
+    await invalidateOrganizerAnalyticsCache(ticketPurchase.event.organizerId);
+  } catch (analyticsError) {
+    console.error(`[Analytics] Failed to update analytics for event ${eventId} after check-in:`, analyticsError);
   }
-
-  await logAudit('TICKET_VALIDATED', 'Ticket', parsed.ticketId, null, {
-    orderId: parsed.orderId,
-  });
 
   return {
     valid: true,
-    event: order.event,
-    ticket: order.items[0]?.ticket,
-    attendee: order.user,
-    message: 'Ticket validated successfully',
+    message: 'Check-in successful!',
+    ticket: {
+      ticketNumber: updatedTicket.ticketNumber,
+      attendeeName: ticketPurchase.user.fullName,
+      ticketType,
+      eventTitle: ticketPurchase.event.title,
+      status: updatedTicket.status,
+      checkedInAt: updatedTicket.checkedInAt,
+    }
   };
 };

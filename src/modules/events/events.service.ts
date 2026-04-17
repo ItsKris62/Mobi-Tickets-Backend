@@ -1,4 +1,5 @@
 import { prisma } from '../../lib/prisma';
+import { redis } from '../../lib/redis';
 import { uploadEventPoster, uploadEventTrailer } from '../../lib/cloudinary';
 import { CreateEventInput, GetEventsQuery } from './events.schema';
 import { MultipartFile } from '@fastify/multipart';
@@ -6,25 +7,107 @@ import { notifyEventAttendees, notifyAdmins } from '../notifications/notificatio
 import { logAudit } from '../../lib/audit';
 import { createSystemAlert } from '../alerts/alerts.service';
 
+// ── Cache helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Invalidate all events list cache keys.
+ * Uses SCAN to avoid blocking Redis with KEYS in production.
+ */
+async function invalidateEventsListCache(): Promise<void> {
+  try {
+    let cursor: number = 0;
+    do {
+      const result = await redis.scan(cursor, { match: 'events:list:*', count: 100 });
+      cursor = Number(result[0]);
+      const keys = result[1] as string[];
+      if (keys.length > 0) {
+        await Promise.all(keys.map((k) => redis.del(k)));
+      }
+    } while (cursor !== 0);
+  } catch (err) {
+    // Non-fatal — log and continue
+    console.warn('[invalidateEventsListCache] Failed:', err);
+  }
+}
+
+/** Safely attempt to get data from Redis cache */
+async function getCache(key: string) {
+  try {
+    const cached = await redis.get(key);
+    if (cached) return typeof cached === 'string' ? JSON.parse(cached) : cached;
+  } catch (err) {
+    console.warn(`[Redis GET] Failed for ${key}:`, err);
+  }
+  return null;
+}
+
+/** Safely attempt to set data in Redis cache */
+async function setCache(key: string, data: any, ttlSeconds: number = 60) {
+  try {
+    await redis.set(key, JSON.stringify(data), { ex: ttlSeconds });
+  } catch (err) {
+    console.warn(`[Redis SET] Failed for ${key}:`, err);
+  }
+}
+
 export const createEvent = async (
   data: CreateEventInput,
   organizerId: string,
   posterFile?: MultipartFile,
   trailerFile?: MultipartFile
 ) => {
-  let posterUrl: string | undefined;
+  const {
+    // These are handled explicitly below (Prisma doesn't accept them in the spread)
+    tickets: _tickets,
+    posterUrl: posterUrlFromBody,
+    ...rest
+  } = data;
+
+  let posterUrl: string | undefined = posterUrlFromBody;
   let videoUrl: string | undefined;
 
   if (posterFile) posterUrl = await uploadEventPoster(posterFile);
   if (trailerFile) videoUrl = await uploadEventTrailer(trailerFile);
 
+  // Create ticket tiers so attendees can book + get QR codes
+  const ticketsInput = _tickets ?? [];
+  const ticketsToCreate =
+    ticketsInput.length > 0
+      ? ticketsInput.map((t) => ({
+          category: t.category,
+          name: t.name,
+          price: Number(t.price),
+          totalQuantity: Number(t.quantity),
+          availableQuantity: Number(t.quantity),
+        }))
+      : rest.maxCapacity
+        ? [
+            {
+              category: 'REGULAR' as const,
+              name: 'Regular',
+              price: 0,
+              totalQuantity: rest.maxCapacity ?? 0,
+              availableQuantity: rest.maxCapacity ?? 0,
+            },
+          ]
+        : [];
+
+  const derivedMaxCapacity =
+    ticketsToCreate.length > 0
+      ? ticketsToCreate.reduce((sum, t) => sum + (t.totalQuantity || 0), 0)
+      : rest.maxCapacity ?? undefined;
+
   return prisma.event.create({
     data: {
-      ...data,
+      ...rest,
       organizerId,
       posterUrl,
       videoUrl,
       isPublished: false,
+      maxCapacity: derivedMaxCapacity,
+      tickets: {
+        create: ticketsToCreate,
+      },
     },
   });
 };
@@ -49,7 +132,7 @@ function formatPublicEvent(event: any) {
     title: event.title,
     description: event.description ? event.description.substring(0, 200) : '',
     posterUrl: event.posterUrl || null,
-    category: event.category || '',
+    category: event.category || 'OTHER',
     venue: location.venue || '',
     location: location.address || '',
     county: event.county || '',
@@ -62,6 +145,7 @@ function formatPublicEvent(event: any) {
       id: event.organizer.id,
       name: event.organizer.fullName || '',
       avatarUrl: event.organizer.avatarUrl || null,
+      // email intentionally excluded from public endpoints
     },
     ticketSummary: {
       lowestPrice: prices.length > 0 ? Math.min(...prices) : 0,
@@ -72,11 +156,16 @@ function formatPublicEvent(event: any) {
         name: t.name,
         category: t.category,
         price: Number(t.price),
+        availableQuantity: t.availableQuantity,
         available: t.availableQuantity,
+        totalQuantity: t.totalQuantity,
       })),
     },
     isSoldOut: totalAvailable === 0,
     createdAt: event.createdAt instanceof Date ? event.createdAt.toISOString() : event.createdAt,
+    publishedAt: event.publishedAt
+      ? (event.publishedAt instanceof Date ? event.publishedAt.toISOString() : event.publishedAt)
+      : null,
   };
 }
 
@@ -100,18 +189,30 @@ const TICKET_SELECT = {
 export const getEvents = async (query: GetEventsQuery) => {
   const { page, limit, search, category, county, featured, startDate, endDate, sortBy, sortOrder } = query;
 
+  // Check Cache First
+  const cacheKey = `events:list:${JSON.stringify(query)}`;
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) return cachedData;
+
+  // Support comma-separated categories: ?category=MUSIC,SPORTS
+  const categoryFilter = category
+    ? category.includes(',')
+      ? { in: category.split(',').map((c) => c.trim().toUpperCase()) }
+      : category.toUpperCase()
+    : undefined;
+
   const where: any = {
     isPublished: true,
     status: 'PUBLISHED',
     deletedAt: null,
     ...(search && {
       OR: [
-        { title: { contains: search } },
-        { description: { contains: search } },
+        { title: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } },
       ],
     }),
-    ...(category && { category }),
-    ...(county && { county }),
+    ...(categoryFilter && { category: categoryFilter }),
+    ...(county && { county: { equals: county, mode: 'insensitive' } }),
     ...(featured === 'true' && { isFeatured: true }),
     ...(startDate && { startTime: { gte: new Date(startDate) } }),
     ...(endDate && { startTime: { lte: new Date(endDate) } }),
@@ -130,7 +231,7 @@ export const getEvents = async (query: GetEventsQuery) => {
       take: limit,
     }),
     prisma.event.findMany({
-      where: { isPublished: true, status: 'PUBLISHED', deletedAt: null, category: { not: null } },
+      where: { isPublished: true, status: 'PUBLISHED', deletedAt: null },
       select: { category: true },
       distinct: ['category'],
     }),
@@ -143,7 +244,7 @@ export const getEvents = async (query: GetEventsQuery) => {
 
   const totalPages = Math.ceil(totalItems / limit);
 
-  return {
+  const result = {
     events: events.map(formatPublicEvent),
     pagination: {
       page,
@@ -158,9 +259,19 @@ export const getEvents = async (query: GetEventsQuery) => {
       counties: allCounties.map((c: any) => c.county).filter(Boolean),
     },
   };
+
+  // Cache the result for 60 seconds
+  await setCache(cacheKey, result, 60);
+
+  return result;
 };
 
 export const getEventById = async (eventId: string) => {
+  // Check Cache First
+  const cacheKey = `events:detail:${eventId}`;
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) return cachedData;
+
   const event = await prisma.event.findFirst({
     where: {
       id: eventId,
@@ -187,12 +298,12 @@ export const getEventById = async (eventId: string) => {
     0
   );
 
-  return {
+  const result = {
     id: event.id,
     title: event.title,
     description: event.description || '',
     posterUrl: event.posterUrl || null,
-    category: event.category || '',
+    category: event.category || 'OTHER',
     venue: location.venue || '',
     location: location.address || '',
     county: event.county || '',
@@ -218,7 +329,13 @@ export const getEventById = async (eventId: string) => {
     isSoldOut: totalAvailable === 0,
     createdAt: event.createdAt.toISOString(),
     updatedAt: event.updatedAt.toISOString(),
+    publishedAt: event.publishedAt?.toISOString() || null,
   };
+
+  // Cache the result for 60 seconds
+  await setCache(cacheKey, result, 60);
+
+  return result;
 };
 
 export const updateEvent = async (
@@ -231,7 +348,7 @@ export const updateEvent = async (
 ) => {
   const event = await prisma.event.findUnique({
     where: { id: eventId },
-    select: { organizerId: true },
+    select: { organizerId: true, isPublished: true },
   });
 
   if (!event) {
@@ -242,20 +359,30 @@ export const updateEvent = async (
     throw new Error('Unauthorized: You can only update your own events');
   }
 
+  const { tickets: _tickets, posterUrl: _posterUrl, ...restData } = data as any;
+
   let posterUrl: string | undefined;
   let videoUrl: string | undefined;
 
   if (posterFile) posterUrl = await uploadEventPoster(posterFile);
   if (trailerFile) videoUrl = await uploadEventTrailer(trailerFile);
 
-  return prisma.event.update({
+  const updated = await prisma.event.update({
     where: { id: eventId },
     data: {
-      ...data,
+      ...restData,
       ...(posterUrl && { posterUrl }),
       ...(videoUrl && { videoUrl }),
     },
   });
+
+  // If the event was published, invalidate cache
+  if (event.isPublished) {
+    await invalidateEventsListCache();
+    await redis.del(`events:detail:${eventId}`);
+  }
+
+  return updated;
 };
 
 export const deleteEvent = async (
@@ -280,6 +407,10 @@ export const deleteEvent = async (
     where: { id: eventId },
     data: { deletedAt: new Date() },
   });
+
+  // Invalidate cache since a published event may have been deleted
+  await invalidateEventsListCache();
+  await redis.del(`events:detail:${eventId}`);
 
   return { message: 'Event deleted successfully' };
 };
@@ -370,6 +501,12 @@ export const postponeEvent = async (
     attendeesNotified: notifiedCount,
   });
 
+  // Invalidate cache if the postponed event was published
+  if (event.isPublished) {
+    await invalidateEventsListCache();
+    await redis.del(`events:detail:${eventId}`);
+  }
+
   return {
     event: updatedEvent,
     attendeesNotified: notifiedCount,
@@ -407,6 +544,10 @@ export const cancelEvent = async (
       isPublished: false,
     },
   });
+
+  // Invalidate cache since a published event was cancelled
+  await invalidateEventsListCache();
+  await redis.del(`events:detail:${eventId}`);
 
   await notifyAdmins(
     'EVENT_CANCELLED',
@@ -468,29 +609,49 @@ export const publishEvent = async (
     throw new Error('Unauthorized: You can only publish your own events');
   }
 
+  // Validation: collect all field errors for wizard highlighting
+  const errors: string[] = [];
+
   if (!event.posterUrl) {
-    throw new Error('Event poster is required before publishing');
+    errors.push('Event poster is required before publishing');
   }
-
-  if (!event.title || !event.description) {
-    throw new Error('Event title and description are required');
+  if (!event.title) {
+    errors.push('Event title is required');
   }
-
+  if (!event.description) {
+    errors.push('Event description is required');
+  }
+  if (!event.county) {
+    errors.push('County is required');
+  }
   if (event.tickets.length === 0) {
-    throw new Error('At least one ticket category must be created before publishing');
+    errors.push('At least one ticket category must be created before publishing');
   }
-
   if (event.startTime < new Date()) {
-    throw new Error('Event start time must be in the future');
+    errors.push('Event start time must be in the future');
   }
 
-  return prisma.event.update({
+  if (errors.length > 0) {
+    const err = new Error(errors[0]) as any;
+    err.statusCode = 400;
+    err.validationErrors = errors;
+    throw err;
+  }
+
+  const published = await prisma.event.update({
     where: { id: eventId },
     data: {
       isPublished: true,
       status: 'PUBLISHED',
+      publishedAt: new Date(),
     },
   });
+
+  // Invalidate public events list cache so the event appears immediately
+  await invalidateEventsListCache();
+  await redis.del(`events:detail:${eventId}`);
+
+  return published;
 };
 
 export const getOrganizerEvents = async (
@@ -531,6 +692,11 @@ export const getOrganizerEvents = async (
 };
 
 export const getFeaturedEvents = async (limit = 10) => {
+  // Check Cache First
+  const cacheKey = `events:featured:${limit}`;
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) return cachedData;
+
   const events = await prisma.event.findMany({
     where: {
       isFeatured: true,
@@ -547,7 +713,11 @@ export const getFeaturedEvents = async (limit = 10) => {
     },
   });
 
-  return events.map(formatPublicEvent);
+  const result = events.map(formatPublicEvent);
+  
+  // Cache featured events for 5 minutes
+  await setCache(cacheKey, result, 300);
+  return result;
 };
 
 export const getEventAttendees = async (

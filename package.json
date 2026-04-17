@@ -10,6 +10,7 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
+    "db:seed": "ts-node --project prisma/tsconfig.seed.json prisma/seed.ts",
     "lint": "eslint src --ext .ts",
     "type-check": "tsc --noEmit",
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -39,6 +40,7 @@
     "argon2": "^0.44.0",
     "cloudinary": "^2.9.0",
     "create-fastify": "^5.0.0",
+    "crypto": "^1.0.1",
     "ethers": "^6.16.0",
     "express-jwt": "^8.5.1",
     "fastify": "^5.7.2",

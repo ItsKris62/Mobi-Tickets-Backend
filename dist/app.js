@@ -1,5 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.broadcastSSENotification = exports.sendSSENotification = void 0;
 const tslib_1 = require("tslib");
 const fastify_1 = tslib_1.__importDefault(require("fastify"));
 const helmet_1 = tslib_1.__importDefault(require("@fastify/helmet"));
@@ -19,6 +20,13 @@ const events_routes_1 = tslib_1.__importDefault(require("./modules/events/events
 const tickets_routes_1 = tslib_1.__importDefault(require("./modules/tickets/tickets.routes"));
 const users_routes_1 = tslib_1.__importDefault(require("./modules/users/users.routes"));
 const admin_routes_1 = tslib_1.__importDefault(require("./modules/admin/admin.routes"));
+const notification_routes_1 = tslib_1.__importDefault(require("./modules/notifications/notification.routes"));
+const flashsales_routes_1 = tslib_1.__importDefault(require("./modules/flashsales/flashsales.routes"));
+const webhooks_routes_1 = tslib_1.__importDefault(require("./modules/webhooks/webhooks.routes"));
+const organizer_routes_1 = tslib_1.__importDefault(require("./modules/organizer/organizer.routes"));
+const payments_routes_1 = tslib_1.__importDefault(require("./modules/payments/payments.routes"));
+const alerts_routes_1 = tslib_1.__importDefault(require("./modules/alerts/alerts.routes"));
+const analytics_routes_1 = tslib_1.__importDefault(require("./modules/tickets/analytics.routes"));
 const fastify = (0, fastify_1.default)({
     logger: {
         level: env_1.envConfig.NODE_ENV === 'production' ? 'info' : 'debug',
@@ -70,7 +78,7 @@ fastify.register(jwt_1.default, {
 fastify.register(multipart_1.default, {
     limits: {
         fileSize: 10 * 1024 * 1024,
-        files: 2,
+        files: 3,
     },
 });
 fastify.register(under_pressure_1.default, {
@@ -81,17 +89,104 @@ fastify.register(under_pressure_1.default, {
 });
 fastify.register(auth_1.default);
 fastify.register(errorHandler_1.default);
-fastify.get('/health', async () => ({
-    status: 'ok',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    env: env_1.envConfig.NODE_ENV,
-}));
+fastify.get('/health', async () => {
+    let redisStatus = 'unknown';
+    try {
+        const pong = await redis_1.redis.ping();
+        redisStatus = pong === 'PONG' ? 'connected' : 'error';
+    }
+    catch {
+        redisStatus = 'disconnected';
+    }
+    return {
+        status: 'ok',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        env: env_1.envConfig.NODE_ENV,
+        services: {
+            redis: redisStatus,
+        },
+    };
+});
 fastify.register(auth_routes_1.default, { prefix: '/api/auth' });
 fastify.register(events_routes_1.default, { prefix: '/api/events' });
 fastify.register(tickets_routes_1.default, { prefix: '/api/tickets' });
 fastify.register(users_routes_1.default, { prefix: '/api/users' });
 fastify.register(admin_routes_1.default, { prefix: '/api/admin' });
+fastify.register(notification_routes_1.default, { prefix: '/api/notifications' });
+fastify.register(flashsales_routes_1.default, { prefix: '/api/flash-sales' });
+fastify.register(organizer_routes_1.default, { prefix: '/api/organizer' });
+fastify.register(payments_routes_1.default, { prefix: '/api/payments' });
+fastify.register(alerts_routes_1.default, { prefix: '/api/admin/alerts' });
+fastify.register(analytics_routes_1.default, { prefix: '/api/analytics' });
+fastify.register(webhooks_routes_1.default, { prefix: '/api/webhooks' });
+const sseConnections = new Map();
+fastify.register(async (instance) => {
+    instance.get('/api/sse/notifications', {
+        preHandler: [instance.authenticate],
+    }, async (request, reply) => {
+        const userId = request.user.id;
+        reply.raw.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'X-Accel-Buffering': 'no',
+        });
+        if (!sseConnections.has(userId)) {
+            sseConnections.set(userId, new Set());
+        }
+        sseConnections.get(userId).add(reply.raw);
+        reply.raw.write(`data: ${JSON.stringify({ type: 'connected', message: 'SSE connection established' })}\n\n`);
+        const pingInterval = setInterval(() => {
+            try {
+                reply.raw.write(`: ping\n\n`);
+            }
+            catch {
+                clearInterval(pingInterval);
+            }
+        }, 30000);
+        request.raw.on('close', () => {
+            clearInterval(pingInterval);
+            const userConnections = sseConnections.get(userId);
+            if (userConnections) {
+                userConnections.delete(reply.raw);
+                if (userConnections.size === 0) {
+                    sseConnections.delete(userId);
+                }
+            }
+            instance.log.info(`SSE connection closed for user ${userId}`);
+        });
+        return reply;
+    });
+});
+const sendSSENotification = (userId, data) => {
+    const userConnections = sseConnections.get(userId);
+    if (userConnections) {
+        const message = `data: ${JSON.stringify(data)}\n\n`;
+        userConnections.forEach((stream) => {
+            try {
+                stream.write(message);
+            }
+            catch {
+            }
+        });
+    }
+};
+exports.sendSSENotification = sendSSENotification;
+const broadcastSSENotification = (data) => {
+    const message = `data: ${JSON.stringify(data)}\n\n`;
+    sseConnections.forEach((connections) => {
+        connections.forEach((stream) => {
+            try {
+                stream.write(message);
+            }
+            catch {
+            }
+        });
+    });
+};
+exports.broadcastSSENotification = broadcastSSENotification;
 fastify.setNotFoundHandler((request, reply) => {
     reply.status(404).send({
         error: 'Route not found',
@@ -104,10 +199,10 @@ const shutdown = async (signal) => {
     try {
         await fastify.close();
         fastify.log.info('HTTP server closed');
-        await prisma_1.prisma.$disconnect();
-        fastify.log.info('Database connection closed');
-        await redis_1.redis.quit();
-        fastify.log.info('Redis connection closed');
+        if (prisma_1.prisma) {
+            await prisma_1.prisma.$disconnect();
+            fastify.log.info('Database connection closed');
+        }
         fastify.log.info('✅ Server shutdown complete');
         process.exit(0);
     }

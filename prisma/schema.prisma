@@ -52,6 +52,18 @@ enum TicketCategory {
   VVIP
 }
 
+enum EventCategory {
+  MUSIC
+  SPORTS
+  CONFERENCE
+  THEATER
+  FESTIVAL
+  COMEDY
+  EXHIBITION
+  WORKSHOP
+  OTHER
+}
+
 enum NotificationType {
   TICKET_PURCHASE
   EVENT_POSTPONED
@@ -133,7 +145,8 @@ model Event {
   postponedAt         DateTime?
 
   // Event categorization
-  category            String?       // Music, Sports, Conference, etc.
+  category            EventCategory @default(OTHER)   // Typed enum (was String?)
+  county              String?       @db.VarChar(100)  // Kenyan county (e.g., "Nairobi", "Mombasa")
   tags                Json?         // Tags for search (stored as JSON array)
 
   // Soft delete
@@ -141,6 +154,7 @@ model Event {
 
   createdAt           DateTime      @default(now())
   updatedAt           DateTime      @updatedAt
+  publishedAt         DateTime?     // Set when status transitions to PUBLISHED
 
   // Featured event
   isFeatured          Boolean       @default(false)
@@ -341,21 +355,21 @@ model FlashSale {
 
 // Analytics tracking for organizers
 model EventAnalytics {
-  id              String   @id @default(uuid()) @db.VarChar(36)
-  eventId         String   @db.VarChar(36)
-  date            DateTime @db.Date // MySQL DATE type - stores date only (no time component)
-  views           Int      @default(0)
-  uniqueVisitors  Int      @default(0)
-  ticketsSold     Int      @default(0)
-  revenue         Float    @default(0)
-  refunds         Int      @default(0)
-  refundAmount    Float    @default(0)
+  id                String   @id @default(uuid())
+  eventId           String   @unique
+  totalTicketsSold  Int      @default(0)
+  totalRevenue      Float    @default(0) // In Kshs
+  totalCapacity     Int      @default(0)
+  totalCheckIns     Int      @default(0)
+  ticketsByType     Json     @default("[]") // [{ type: "VIP", sold: 10, revenue: 20000 }]
+  salesByDay        Json     @default("[]") // [{ date: "2026-06-01", count: 5, revenue: 5000 }]
+  lastUpdated       DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
-  event           Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  event             Event    @relation(fields: [eventId], references: [id])
 
-  @@unique([eventId, date])
   @@index([eventId])
-  @@index([date])
   @@map("event_analytics")
 }
 
@@ -408,12 +422,15 @@ model ScheduledPost {
 // Simplifies the User → Order → OrderItem → Ticket traversal
 model TicketPurchase {
   id          String   @id @default(uuid()) @db.VarChar(36)
+  ticketNumber String  @unique
   userId      String   @db.VarChar(36)
   orderId     String   @db.VarChar(36)
   ticketId    String   @db.VarChar(36)
   eventId     String   @db.VarChar(36)
   purchasedAt DateTime @default(now())
   status      String   @default("ACTIVE") // ACTIVE, USED, CANCELLED, REFUNDED
+  qrCodeData  String   @unique
+  checkedInAt DateTime?
 
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)

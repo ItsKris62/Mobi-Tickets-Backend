@@ -11,7 +11,12 @@ const path_1 = tslib_1.__importDefault(require("path"));
 const envSchema = zod_1.z.object({
     NODE_ENV: zod_1.z.enum(['development', 'production', 'test']).default('development'),
     DATABASE_URL: zod_1.z.string().min(1, 'DATABASE_URL is required'),
-    REDIS_URL: zod_1.z.string().min(1, 'REDIS_URL is required'),
+    UPSTASH_REDIS_REST_URL: zod_1.z.string().url('UPSTASH_REDIS_REST_URL must be a valid URL'),
+    UPSTASH_REDIS_REST_TOKEN: zod_1.z.string().min(1, 'UPSTASH_REDIS_REST_TOKEN is required'),
+    QSTASH_TOKEN: zod_1.z.string().min(1, 'QSTASH_TOKEN is required'),
+    QSTASH_CURRENT_SIGNING_KEY: zod_1.z.string().min(1, 'QSTASH_CURRENT_SIGNING_KEY is required'),
+    QSTASH_NEXT_SIGNING_KEY: zod_1.z.string().min(1, 'QSTASH_NEXT_SIGNING_KEY is required'),
+    WEBHOOK_BASE_URL: zod_1.z.string().url().optional(),
     JWT_SECRET: zod_1.z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
     JWT_REFRESH_SECRET: zod_1.z.string().min(32, 'JWT_REFRESH_SECRET must be at least 32 characters'),
     JWT_ACCESS_EXPIRATION: zod_1.z.string().default('15m'),
@@ -25,12 +30,8 @@ const envSchema = zod_1.z.object({
     RATE_LIMIT_WINDOW_MS: zod_1.z.coerce.number().default(60000),
     CORS_ORIGIN: zod_1.z.string().default('http://localhost:3000'),
     CORS_CREDENTIALS: zod_1.z.coerce.boolean().default(true),
-    SMTP_HOST: zod_1.z.string().optional(),
-    SMTP_PORT: zod_1.z.coerce.number().default(587),
-    SMTP_SECURE: zod_1.z.coerce.boolean().default(false),
-    SMTP_USER: zod_1.z.string().optional(),
-    SMTP_PASS: zod_1.z.string().optional(),
-    SMTP_FROM: zod_1.z.string().default('noreply@mobitickets.com'),
+    RESEND_API_KEY: zod_1.z.string().min(1, 'RESEND_API_KEY is required'),
+    EMAIL_FROM: zod_1.z.string().default('MobiTickets <onboarding@resend.dev>'),
 });
 const env = envSchema.safeParse(process.env);
 if (!env.success) {
